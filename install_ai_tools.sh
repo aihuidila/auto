@@ -40,9 +40,9 @@ check_nodejs() {
     # 检查 node 是否满足版本（>=18）
     if ! command -v node &> /dev/null || [ $(node -v | cut -d'v' -f2 | cut -d'.' -f1) -lt 18 ]; then
         print_info "正在通过 nvm 安装 Node.js v20 (LTS)..."
-        nvm install 20
-        nvm use 20
-        nvm alias default 20
+        nvm install 22
+        nvm use 22
+        nvm alias default 22
     fi
     
     print_success "当前 Node.js 版本: $(node -v)"
