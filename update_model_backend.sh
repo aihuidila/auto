@@ -1,97 +1,95 @@
 #!/bin/bash
 
-# --- 配置参数 ---
+# --- 基础配置 ---
 CONTAINER_NAME="zhiwen-mysql"
 DB_USER="root"
 DB_PASS="zhiwen_password"
 DB_NAME="ames"
 
-# 定义执行数据库命令的函数，避免警告
-function mysql_exec() {
-    local sql_cmd=$1
-    # 使用 bash -c 配合 MYSQL_PWD 环境变量隐藏密码
-    sudo docker exec -i $CONTAINER_NAME bash -c "export MYSQL_PWD='$DB_PASS'; mysql -u$DB_USER $DB_NAME $sql_cmd"
+# 数据库执行函数 (隐藏密码警告)
+function db_query() {
+    sudo docker exec -i $CONTAINER_NAME bash -c "export MYSQL_PWD='$DB_PASS'; mysql -u$DB_USER $DB_NAME -N -s -e \"$1\""
 }
 
-# 1. 查询私有化导入的模型 (source='upload')
-echo "--------------------------------"
-echo "正在从数据库查询私有化导入的模型..."
-MODELS_DATA=$(mysql_exec "-N -e \"SELECT name, worker_name FROM model_store WHERE source='upload';\"")
+function db_update() {
+    sudo docker exec -i $CONTAINER_NAME bash -c "export MYSQL_PWD='$DB_PASS'; mysql -u$DB_USER $DB_NAME -e \"$1\""
+}
 
-if [ -z "$MODELS_DATA" ]; then
-    echo "未找到 source='upload' 的模型，退出。"
+echo "========================================"
+echo "   私有化模型启动方式修改工具"
+echo "========================================"
+
+# 1. 查询模型
+echo "正在提取 source='upload' 的模型列表..."
+# 获取数据，使用 | 分隔 name 和 worker_name
+RAW_DATA=$(db_query "SELECT CONCAT(name, '|', IFNULL(worker_name,'NULL')) FROM model_store WHERE source='upload';")
+
+if [ -z "$RAW_DATA" ]; then
+    echo "未找到任何私有化导入的模型，请检查数据库。"
     exit 0
 fi
 
-# 将查询结果转换为数组
-model_names=()
-worker_names=()
-while read -r name worker; do
-    model_names+=("$name")
-    worker_names+=("$worker")
-done <<< "$MODELS_DATA"
+# 2. 解析数据并显示
+models=()
+workers=()
+i=0
+while read -r line; do
+    name=$(echo $line | cut -d'|' -f1)
+    worker=$(echo $line | cut -d'|' -f2)
+    models+=("$name")
+    workers+=("$worker")
+    echo " [$i] 模型名称: $name"
+    echo "     当前 Worker: ${worker}"
+    echo "----------------------------------------"
+    ((i++))
+done <<< "$RAW_DATA"
 
-# 2. 选择对应模型
-echo "--------------------------------"
-echo "查询到以下私有化模型，请输入编号进行修改:"
-for i in "${!model_names[@]}"; do
-    # 如果 worker 为空，显示为 "未设置"
-    current_worker=${worker_names[$i]}
-    if [ "$current_worker" == "NULL" ] || [ -z "$current_worker" ]; then
-        current_worker="[未设置]"
-    fi
-    printf "[%d] 模型名: %-25s | 当前 Worker: %s\n" "$i" "${model_names[$i]}" "$current_worker"
-done
+# 3. 交互输入 (针对 curl | bash 环境优化)
+echo -n "请选择模型编号: "
+read -r model_idx < /dev/tty
 
-read -p "请输入模型编号: " model_idx
-
-# 校验输入
-if [[ ! $model_idx =~ ^[0-9]+$ ]] || [ $model_idx -ge ${#model_names[@]} ]; then
-    echo "无效的选择，程序结束。"
+if [[ ! $model_idx =~ ^[0-9]+$ ]] || [ $model_idx -ge ${#models[@]} ]; then
+    echo "错误: 输入编号无效。"
     exit 1
 fi
 
-SELECTED_MODEL=${model_names[$model_idx]}
-SELECTED_WORKER=${worker_names[$model_idx]}
+target_model=${models[$model_idx]}
+target_worker=${workers[$model_idx]}
 
-# 3. 选择 backend_type
-echo "--------------------------------"
-echo "请选择新的 backend_type (输入数字):"
-options=("vllm" "ftransformers" "vox-box")
-PS3="选择编号: "
-select opt in "${options[@]}"; do
-    case $opt in
-        "vllm"|"ftransformers"|"vox-box")
-            NEW_BACKEND=$opt
-            break
-            ;;
-        *) echo "无效选项，请重新输入数字选择。";;
-    esac
-done
+echo -e "\n请选择新的 backend_type:"
+echo " 1) vllm"
+echo " 2) ftransformers"
+echo " 3) vox-box"
+echo -n "请输入选项 (1-3): "
+read -r backend_choice < /dev/tty
 
-# 4. 判断并处理 worker_name
-UPDATE_WORKER_SQL=""
-if [[ -z "$SELECTED_WORKER" || "$SELECTED_WORKER" == "NULL" ]]; then
-    echo "--------------------------------"
-    echo "提示：检测到 worker_name 为空，将自动补全为 'worker qujing 2'"
-    UPDATE_WORKER_SQL=", worker_name='worker qujing 2'"
+case $backend_choice in
+    1) new_backend="vllm" ;;
+    2) new_backend="ftransformers" ;;
+    3) new_backend="vox-box" ;;
+    *) echo "错误: 选择无效"; exit 1 ;;
+esac
+
+# 4. 逻辑判断 worker_name
+worker_sql=""
+if [ "$target_worker" == "NULL" ] || [ -z "$target_worker" ]; then
+    echo ">>> 检测到 worker_name 为空，自动设置为: worker qujing 2"
+    worker_sql=", worker_name='worker qujing 2'"
 else
-    echo "--------------------------------"
-    echo "检测到已有 worker_name ($SELECTED_WORKER)，将保持现状。"
+    echo ">>> 检测到已有 worker_name，跳过修改。"
 fi
 
-# 5. 执行数据库更新
-SQL_EXEC="UPDATE model_store SET backend_type='$NEW_BACKEND' $UPDATE_WORKER_SQL WHERE name='$SELECTED_MODEL' AND source='upload';"
-
-echo "正在执行数据库更新..."
-mysql_exec "-e \"$SQL_EXEC\""
+# 5. 执行更新
+echo -e "\n正在更新数据库..."
+final_sql="UPDATE model_store SET backend_type='$new_backend' $worker_sql WHERE name='$target_model' AND source='upload';"
+db_update "$final_sql"
 
 if [ $? -eq 0 ]; then
-    echo "--------------------------------"
-    echo "成功：模型 '$SELECTED_MODEL' 已成功配置！"
-    echo "Backend: $NEW_BACKEND"
-    [ -n "$UPDATE_WORKER_SQL" ] && echo "Worker : worker qujing 2"
+    echo "========================================"
+    echo " 修改成功！"
+    echo " 模型: $target_model"
+    echo " 后端: $new_backend"
+    echo "========================================"
 else
-    echo "--------------------------------"
-    echo "错误：数据库更新失败，请检查容器状态。"
+    echo "更新过程中出现错误，请检查数据库连接。"
 fi
