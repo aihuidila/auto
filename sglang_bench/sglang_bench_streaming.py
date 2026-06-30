@@ -411,10 +411,10 @@ def generate_report(all_results, results_dir, args, model_name):
                             str(ilen), str(p.get("output_len", "")),
                             str(conc), str(p.get("request_rate", "")),
                             str(p.get("prompts", "")), str(reqs),
-                            str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
-                            str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
-                            str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
-                            str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
+                            str(t['mean']), str(t['p50']), str(t['p99']),
+                            str(tp['mean']), str(tp['p50']), str(tp['p99']),
+                            str(it['mean']), str(it['p50']), str(it['p99']),
+                            str(e2['mean']), str(e2['p50']), str(e2['p99']),
                             str(out_tok_s), str(tot_tok_s), str(tok_per_req),
                         ])
                     else:
@@ -425,10 +425,10 @@ def generate_report(all_results, results_dir, args, model_name):
                             str(p.get("input_len", "")), str(p.get("output_len", "")),
                             str(p.get("concurrency", "")), str(p.get("request_rate", "")),
                             str(p.get("prompts", "")), str(reqs),
-                            str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
-                            str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
-                            str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
-                            str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
+                            str(t['mean']), str(t['p50']), str(t['p99']),
+                            str(tp['mean']), str(tp['p50']), str(tp['p99']),
+                            str(it['mean']), str(it['p50']), str(it['p99']),
+                            str(e2['mean']), str(e2['p50']), str(e2['p99']),
                             str(out_tok_s), str(tot_tok_s), str(tok_per_req),
                         ])
 
@@ -439,12 +439,12 @@ def generate_report(all_results, results_dir, args, model_name):
                     m = run["metrics"]
                     s = run["summary"]
                     f.write("### 结果\n\n")
-                    f.write("| 指标 | Mean | p50 | p90 | p99 | Min | Max |\n")
-                    f.write("|------|------|-----|-----|-----|-----|------|\n")
-                    f.write(f"| TTFT (ms) | {m['TTFT']['mean']:.1f} | {m['TTFT']['p50']:.1f} | {m['TTFT']['p90']:.1f} | {m['TTFT']['p99']:.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
-                    f.write(f"| TPOT (ms) | {m['TPOT']['mean']:.1f} | {m['TPOT']['p50']:.1f} | {m['TPOT']['p90']:.1f} | {m['TPOT']['p99']:.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
-                    f.write(f"| ITL (ms)  | {m['ITL']['mean']:.1f} | {m['ITL']['p50']:.1f} | {m['ITL']['p90']:.1f} | {m['ITL']['p99']:.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
-                    f.write(f"| E2E (ms)  | {m['E2E']['mean']:.1f} | {m['E2E']['p50']:.1f} | {m['E2E']['p90']:.1f} | {m['E2E']['p99']:.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
+                    f.write("| 指标 | Mean | p50 | p99 | Min | Max |\n")
+                    f.write("|------|------|-----|-----|-----|------|\n")
+                    f.write(f"| TTFT (ms) | {m['TTFT']['mean']:.1f} | {m['TTFT']['p50']:.1f} | {m['TTFT']['p99']:.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
+                    f.write(f"| TPOT (ms) | {m['TPOT']['mean']:.1f} | {m['TPOT']['p50']:.1f} | {m['TPOT']['p99']:.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
+                    f.write(f"| ITL (ms)  | {m['ITL']['mean']:.1f} | {m['ITL']['p50']:.1f} | {m['ITL']['p99']:.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
+                    f.write(f"| E2E (ms)  | {m['E2E']['mean']:.1f} | {m['E2E']['p50']:.1f} | {m['E2E']['p99']:.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
                     out_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
                     tot_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
                     f.write(f"- Requests: {m['num_requests']}\n")
@@ -457,10 +457,10 @@ def generate_report(all_results, results_dir, args, model_name):
                         str(run["params"].get("input_len", "")), str(run["params"].get("output_len", "")),
                         str(run["params"].get("concurrency", "")), "inf",
                         str(run["params"].get("prompts", "")), str(m["num_requests"]),
-                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p90']), str(m['TTFT']['p99']),
-                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p90']), str(m['TPOT']['p99']),
-                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p90']), str(m['ITL']['p99']),
-                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p90']), str(m['E2E']['p99']),
+                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p99']),
+                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p99']),
+                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p99']),
+                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p99']),
                         str(out_s), str(tot_s), str(tok_pr),
                     ])
 
