@@ -46,12 +46,13 @@ SCENARIOS["02_output_len_scan"] = {
     "values": [64, 128, 256, 512],
 }
 
-# ----- 场景 3: 并发扩展（固定输入 1024，输出 128） -----
+# ----- 场景 3: 并发扩展（固定输入 1024，输出 128，1→512） -----
 SCENARIOS["03_concurrency_scan"] = {
-    "desc": "并发扩展 — 固定 input_len=1024, output_len=128, burst",
+    "desc": "并发扩展 — 固定 input_len=1024, output_len=128, burst, 1→512",
     "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 200},
     "vary": "concurrency",
-    "values": [1, 4, 8, 16, 32, 64],
+    "values": [1, 4, 8, 16, 32, 64, 128, 256, 512],
+    "timeout": 1800,  # concur=1 单线程很慢
 }
 
 # ----- 场景 4: 请求速率扫描（固定输入 1024，输出 128，并发 64） -----
@@ -75,14 +76,7 @@ SCENARIOS["05_prefix_cache"] = {
     "timeout": 1800,  # 30 min for GSP
 }
 
-# ----- 场景 6: 大并发极限摸高（固定输入 1024，输出 128） -----
-SCENARIOS["06_stress_test"] = {
-    "desc": "极限摸高 — input=1024, output=128, concurrency=128/256, burst",
-    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 300},
-    "vary": "concurrency",
-    "values": [128, 256],
-    "timeout": 1200,  # 20 min for stress
-}
+# （已合并到场景 3，不再单独测试）
 
 
 # ─────────────────────────────────────────────
@@ -381,11 +375,11 @@ def generate_report(all_results, results_dir, args, model_name):
         csv_header = [
             "scenario", "vary_param", "input_len", "output_len", "concurrency",
             "request_rate", "num_prompts", "successful",
-            "TTFT_mean", "TTFT_p50", "TTFT_p99",
-            "TPOT_mean", "TPOT_p50", "TPOT_p99",
-            "ITL_mean", "ITL_p50", "ITL_p99",
-            "E2E_mean", "E2E_p50", "E2E_p99",
-            "output_tok_s", "total_tok_s",
+            "TTFT_mean", "TTFT_p50", "TTFT_p90", "TTFT_p99",
+            "TPOT_mean", "TPOT_p50", "TPOT_p90", "TPOT_p99",
+            "ITL_mean", "ITL_p50", "ITL_p90", "ITL_p99",
+            "E2E_mean", "E2E_p50", "E2E_p90", "E2E_p99",
+            "output_tok_s", "total_tok_s", "tok_per_req",
         ]
         csv_rows.append(csv_header)
 
@@ -396,8 +390,14 @@ def generate_report(all_results, results_dir, args, model_name):
             f.write(f"## {scenario_name}: {scenario['desc']}\n\n")
 
             if scenario.get("vary"):
-                f.write(f"| {scenario['vary']} | Reqs | TTFT(mean) | TTFT(p50) | TTFT(p99) | TPOT(mean) | TPOT(p50) | TPOT(p99) | ITL(mean) | ITL(p50) | ITL(p99) | E2E(mean) | E2E(p50) | E2E(p99) | Output tok/s | Total tok/s |\n")
-                f.write("|" + "---|" * 16 + "\n")
+                hdr_cols = 18  # vary + Reqs + 4xTTFT(ms) + 4xTPOT(ms) + 4xITL(ms) + 4xE2E(ms) + Output tok/s + Total tok/s + Tok/s per req
+                f.write(f"| {scenario['vary']} | Reqs"
+                        f" | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
+                        f" | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
+                        f" | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
+                        f" | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
+                        f" | Output tok/s | Total tok/s | Tok/s per req |\n")
+                f.write("|" + "---|" * hdr_cols + "\n")
 
                 for run in runs:
                     if run is None:
@@ -417,14 +417,15 @@ def generate_report(all_results, results_dir, args, model_name):
                     e2 = m["E2E"]
                     out_tok_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
                     tot_tok_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
+                    tok_per_req = round(1000 / tp["p50"], 1) if tp["p50"] > 0 else 0
 
                     f.write(
                         f"| {vary_val} | {reqs}"
-                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p99']:.0f}"
-                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p99']:.1f}"
-                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p99']:.1f}"
-                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p99']:.0f}"
-                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} |\n"
+                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p90']:.0f} | {t['p99']:.0f}"
+                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p90']:.1f} | {tp['p99']:.1f}"
+                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p90']:.1f} | {it['p99']:.1f}"
+                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p90']:.0f} | {e2['p99']:.0f}"
+                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} | {tok_per_req} |\n"
                     )
 
                     csv_rows.append([
@@ -432,11 +433,11 @@ def generate_report(all_results, results_dir, args, model_name):
                         str(p.get("input_len", "")), str(p.get("output_len", "")),
                         str(p.get("concurrency", "")), str(p.get("request_rate", "")),
                         str(p.get("prompts", "")), str(reqs),
-                        str(t['mean']), str(t['p50']), str(t['p99']),
-                        str(tp['mean']), str(tp['p50']), str(tp['p99']),
-                        str(it['mean']), str(it['p50']), str(it['p99']),
-                        str(e2['mean']), str(e2['p50']), str(e2['p99']),
-                        str(out_tok_s), str(tot_tok_s),
+                        str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
+                        str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
+                        str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
+                        str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
+                        str(out_tok_s), str(tot_tok_s), str(tok_per_req),
                     ])
             else:
                 # 单次运行场景（如 GSP）
