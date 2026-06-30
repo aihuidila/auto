@@ -160,10 +160,10 @@ def collect_jsonl_metrics(jsonl_path):
         "max":  q(data, "max_e2e_latency_ms"),
     }
 
-    # 兜底：如果 summary 全为 0（理论不会），从原始列表重算
-    if ttft_s["mean"] == 0 and ttft_list:
+    # 兜底：如果 summary 分位数缺失（p90=0），从原始列表重算
+    if ttft_s["p90"] == 0 and ttft_list:
         ttft_s = stats(ttft_list)
-    if itl_s["mean"] == 0 and itl_list:
+    if itl_s["p90"] == 0 and itl_list:
         itl_s = stats(itl_list)
 
     num_ok = q(data, "completed", 0)
@@ -498,7 +498,7 @@ def generate_report(all_results, results_dir, args, model_name):
                         il = run["params"]["input_len"]
                         ttft = run["metrics"]["TTFT"]["mean"]
                         per_tok = ttft / il if il > 0 else 0
-                        f.write(f"| {il} | {ttft:.0f} | {per_tok:.4f} |\n")
+                        f.write(f"| {il} | 1 | {ttft:.0f} | {per_tok:.4f} |\n")
                 f.write("\n")
                 break
 
