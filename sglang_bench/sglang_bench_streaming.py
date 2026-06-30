@@ -41,16 +41,16 @@ SCENARIOS["01_input_len_scan"] = {
     # 场景级 timeout (每个单测另有各自 timeout)
     "timeout": 7200,
     "groups": [
-        {"name": "L1 短基线",  "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
-        {"name": "L2 短基线",  "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
-        {"name": "L2 中等",    "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
-        {"name": "L2 中长",    "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64],        "prompts": 80},
-        {"name": "L2 长",      "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32],            "prompts": 60},
-        {"name": "L2 超长",    "input_len": 65536,   "concurrency": [1, 4, 8, 16],               "prompts": 50},
-        {"name": "L2 极长",    "input_len": 131072,  "concurrency": [1, 4, 8],                   "prompts": 40},
-        {"name": "L3 长",      "input_len": 262144,  "concurrency": [1, 4, 8],                   "prompts": 30},
-        {"name": "L4 超长",    "input_len": 524288,  "concurrency": [1, 4],                      "prompts": 20},
-        {"name": "L5 极限",    "input_len": 1048576, "concurrency": [1, 2],                      "prompts": 20},
+        {"name": "L1-1 短基线", "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 100},
+        {"name": "L1-2 短基线", "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 100},
+        {"name": "L2-1 中等",   "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 100},
+        {"name": "L2-2 中长",   "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64],      "prompts": 80},
+        {"name": "L3-1 长",     "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32],          "prompts": 60},
+        {"name": "L3-2 长",     "input_len": 65536,   "concurrency": [1, 4, 8, 16],              "prompts": 50},
+        {"name": "L4-1 超长",   "input_len": 131072,  "concurrency": [1, 4, 8],                  "prompts": 40},
+        {"name": "L4-2 超长",   "input_len": 262144,  "concurrency": [1, 4, 8],                  "prompts": 30},
+        {"name": "L5-1 极限",   "input_len": 524288,  "concurrency": [1, 4],                     "prompts": 20},
+        {"name": "L5-2 极限",   "input_len": 1048576, "concurrency": [1, 2],                     "prompts": 20},
     ],
 }
 
