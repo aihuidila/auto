@@ -30,53 +30,29 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 SCENARIOS = OrderedDict()
 
-# ----- 场景 1: 输入长度扫描（固定输出 128，并发 8） -----
+# ----- 场景 1: 基准输入长度扫描 -----
+# 固定输出长度 512，逐步拉长输入，每级观察 TTFT 增长和并发扩展性
+# concurrency=0 表示不限并发（burst 全部发出）
 SCENARIOS["01_input_len_scan"] = {
-    "desc": "输入长度扫描 — 固定 output_len=128, concurrency=8",
-    "fixed": {"output_len": 128, "concurrency": 8, "request_rate": "inf", "prompts": 200},
-    "vary": "input_len",
-    "values": [128, 512, 1024, 2048, 4096],
+    "desc": "基准: 输入长度扫描 — 固定 output_len=512, 逐级改变并发",
+    "type": "multi_vary",
+    "output_len": 512,
+    "request_rate": "inf",
+    # 场景级 timeout (每个单测另有各自 timeout)
+    "timeout": 7200,
+    "groups": [
+        {"name": "L1 短基线",  "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
+        {"name": "L2 短基线",  "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
+        {"name": "L2 中等",    "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
+        {"name": "",           "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64, 0],        "prompts": 80},
+        {"name": "",           "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32, 0],            "prompts": 60},
+        {"name": "",           "input_len": 65536,   "concurrency": [1, 4, 8, 16, 0],               "prompts": 50},
+        {"name": "",           "input_len": 131072,  "concurrency": [1, 4, 8, 0],                   "prompts": 40},
+        {"name": "L3 长",      "input_len": 262144,  "concurrency": [1, 4, 8],                      "prompts": 30},
+        {"name": "L4 超长",    "input_len": 524288,  "concurrency": [1, 4],                         "prompts": 20},
+        {"name": "L5 极限",    "input_len": 1048576, "concurrency": [1, 2],                         "prompts": 20},
+    ],
 }
-
-# ----- 场景 2: 输出长度扫描（固定输入 1024，并发 8） -----
-SCENARIOS["02_output_len_scan"] = {
-    "desc": "输出长度扫描 — 固定 input_len=1024, concurrency=8",
-    "fixed": {"input_len": 1024, "concurrency": 8, "request_rate": "inf", "prompts": 200},
-    "vary": "output_len",
-    "values": [64, 128, 256, 512],
-}
-
-# ----- 场景 3: 并发扩展（固定输入 1024，输出 128，1→512） -----
-SCENARIOS["03_concurrency_scan"] = {
-    "desc": "并发扩展 — 固定 input_len=1024, output_len=128, burst, 1→512",
-    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 200},
-    "vary": "concurrency",
-    "values": [1, 4, 8, 16, 32, 64, 128, 256, 512],
-    "timeout": 1800,  # concur=1 单线程很慢
-}
-
-# ----- 场景 4: 请求速率扫描（固定输入 1024，输出 128，并发 64） -----
-SCENARIOS["04_rate_scan"] = {
-    "desc": "请求速率扫描 — 固定 input_len=1024, output_len=128, concurrency=64",
-    "fixed": {"input_len": 1024, "output_len": 128, "concurrency": 64, "prompts": 500, "request_rate": "inf"},
-    "vary": "request_rate",
-    "values": ["inf", 50, 20, 10, 5],
-}
-
-# ----- 场景 5: 前缀缓存压测（GSP） -----
-SCENARIOS["05_prefix_cache"] = {
-    "desc": "前缀缓存压测 — GSP: 32 groups × 16 prompts, system=2048, question=128",
-    "fixed": {
-        "concurrency": 64, "request_rate": "inf", "prompts": 512,
-        "gsp_groups": 32, "gsp_per_group": 16,
-        "gsp_system": 2048, "gsp_question": 128, "gsp_output": 256,
-    },
-    "vary": None,
-    "values": [None],  # single run
-    "timeout": 1800,  # 30 min for GSP
-}
-
-# （已合并到场景 3，不再单独测试）
 
 
 # ─────────────────────────────────────────────
@@ -249,7 +225,6 @@ def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_
         "--tokenizer", params["tokenizer"],
         "--num-prompts", str(params["prompts"]),
         "--request-rate", str(params["request_rate"]),
-        "--max-concurrency", str(params["concurrency"]),
         "--output-file", result_file,
         "--output-details",
         "--warmup-requests", "10",
@@ -257,6 +232,11 @@ def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_
         "--apply-chat-template",
         # 注意: 不加 --disable-stream，保持流式
     ]
+
+    # concurrency=0 表示不限并发，不传 --max-concurrency
+    concur = params.get("concurrency")
+    if concur and concur > 0:
+        cmd += ["--max-concurrency", str(concur)]
 
     if params.get("model"):
         cmd += ["--model", params["model"]]
@@ -298,15 +278,14 @@ def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_
     stderr = proc.stderr
 
     if proc.returncode != 0:
-        print(f"✗ (exit={proc.returncode}, {elapsed:.0f}s)")
-        # 打印错误摘要
+        print(f"[FAIL exit={proc.returncode}, {elapsed:.0f}s]")
         err_lines = stderr.strip().split("\n")[-5:]
         for line in err_lines:
             if line.strip():
                 print(f"      {line.strip()}")
         return None
 
-    print(f"✓ ({elapsed:.0f}s)")
+    print(f"[OK {elapsed:.0f}s]")
 
     # 解析结果
     metrics = collect_jsonl_metrics(result_file)
@@ -362,11 +341,12 @@ def generate_report(all_results, results_dir, args, model_name):
         f.write("---\n\n## 指标说明\n\n")
         f.write("| 指标 | 含义 |\n")
         f.write("|------|------|\n")
-        f.write("| **TTFT** | Time To First Token — 首 token 延迟，反映 prefill 速度 |\n")
-        f.write("| **TPOT** | Time Per Output Token — 每个输出 token 平均耗时，反映 decode 速度 |\n")
-        f.write("| **ITL** | Inter-Token Latency — token 间延迟抖动，反映流式平滑度 |\n")
-        f.write("| **E2E** | End-to-End Latency — 请求总完成时间 |\n")
-        f.write("| **tok/s** | Output token throughput — 每秒输出 token 数 |\n\n")
+        f.write("| **TTFT** | Time To First Token — 首 token 延迟 (ms)，反映 prefill 速度 |\n")
+        f.write("| **TPOT** | Time Per Output Token — 每个输出 token 平均耗时 (ms)，反映 decode 速度 |\n")
+        f.write("| **ITL** | Inter-Token Latency — token 间延迟抖动 (ms)，反映流式平滑度 |\n")
+        f.write("| **E2E** | End-to-End Latency — 请求总完成时间 (ms) |\n")
+        f.write("| **Tok/s per req** | 单论次吞吐 = 1000 / TPOT(p50) |\n")
+        f.write("| **Output tok/s** | 系统级输出 token 吞吐量 |\n\n")
 
         f.write("---\n\n")
 
@@ -389,25 +369,36 @@ def generate_report(all_results, results_dir, args, model_name):
             scenario = SCENARIOS[scenario_name]
             f.write(f"## {scenario_name}: {scenario['desc']}\n\n")
 
-            if scenario.get("vary"):
-                hdr_cols = 18  # vary + Reqs + 4xTTFT(ms) + 4xTPOT(ms) + 4xITL(ms) + 4xE2E(ms) + Output tok/s + Total tok/s + Tok/s per req
-                f.write(f"| {scenario['vary']} | Reqs"
-                        f" | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
-                        f" | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
-                        f" | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
-                        f" | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
-                        f" | Output tok/s | Total tok/s | Tok/s per req |\n")
-                f.write("|" + "---|" * hdr_cols + "\n")
+            is_multi = scenario.get("type") == "multi_vary"
+
+            # ---- multi_vary / vary 共用表格逻辑 ----
+            if is_multi or scenario.get("vary"):
+                if is_multi:
+                    # 表头: Input Len | Concur | Reqs | ...
+                    hdr_cnt = 20
+                    f.write("| Input Len | Concur | Reqs"
+                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
+                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
+                            " | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
+                            " | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
+                            " | Output tok/s | Total tok/s | Tok/s per req |\n")
+                else:
+                    hdr_cnt = 18
+                    f.write(f"| {scenario['vary']} | Reqs"
+                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
+                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
+                            " | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
+                            " | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
+                            " | Output tok/s | Total tok/s | Tok/s per req |\n")
+                f.write("|" + "---|" * hdr_cnt + "\n")
 
                 for run in runs:
                     if run is None:
                         continue
                     p = run["params"]
-                    vary_val = p.get("vary_name", "")
                     m = run["metrics"]
                     s = run["summary"]
                     if m is None:
-                        f.write(f"| {vary_val} | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |\n")
                         continue
 
                     reqs = m["num_requests"]
@@ -419,35 +410,54 @@ def generate_report(all_results, results_dir, args, model_name):
                     tot_tok_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
                     tok_per_req = round(1000 / tp["p50"], 1) if tp["p50"] > 0 else 0
 
-                    f.write(
-                        f"| {vary_val} | {reqs}"
+                    metric_cols = (
                         f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p90']:.0f} | {t['p99']:.0f}"
                         f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p90']:.1f} | {tp['p99']:.1f}"
                         f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p90']:.1f} | {it['p99']:.1f}"
                         f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p90']:.0f} | {e2['p99']:.0f}"
-                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} | {tok_per_req} |\n"
+                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} | {tok_per_req}"
                     )
 
-                    csv_rows.append([
-                        scenario_name, str(vary_val),
-                        str(p.get("input_len", "")), str(p.get("output_len", "")),
-                        str(p.get("concurrency", "")), str(p.get("request_rate", "")),
-                        str(p.get("prompts", "")), str(reqs),
-                        str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
-                        str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
-                        str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
-                        str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
-                        str(out_tok_s), str(tot_tok_s), str(tok_per_req),
-                    ])
+                    if is_multi:
+                        ilen = p.get("input_len", "")
+                        conc = p.get("concurrency", "")
+                        conc_label = "∞" if conc == 0 else str(conc)
+                        f.write(f"| {ilen} / {conc_label} | {reqs}{metric_cols} |\n")
+                        csv_rows.append([
+                            scenario_name, f"{ilen}/{conc}",
+                            str(ilen), str(p.get("output_len", "")),
+                            str(conc), str(p.get("request_rate", "")),
+                            str(p.get("prompts", "")), str(reqs),
+                            str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
+                            str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
+                            str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
+                            str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
+                            str(out_tok_s), str(tot_tok_s), str(tok_per_req),
+                        ])
+                    else:
+                        vary_val = p.get("vary_name", "")
+                        f.write(f"| {vary_val} | {reqs}{metric_cols} |\n")
+                        csv_rows.append([
+                            scenario_name, str(vary_val),
+                            str(p.get("input_len", "")), str(p.get("output_len", "")),
+                            str(p.get("concurrency", "")), str(p.get("request_rate", "")),
+                            str(p.get("prompts", "")), str(reqs),
+                            str(t['mean']), str(t['p50']), str(t['p90']), str(t['p99']),
+                            str(tp['mean']), str(tp['p50']), str(tp['p90']), str(tp['p99']),
+                            str(it['mean']), str(it['p50']), str(it['p90']), str(it['p99']),
+                            str(e2['mean']), str(e2['p50']), str(e2['p90']), str(e2['p99']),
+                            str(out_tok_s), str(tot_tok_s), str(tok_per_req),
+                        ])
+
             else:
-                # 单次运行场景（如 GSP）
+                # 单次运行场景
                 run = runs[0] if runs else None
                 if run and run["metrics"]:
                     m = run["metrics"]
                     s = run["summary"]
                     f.write("### 结果\n\n")
-                    f.write(f"| 指标 | Mean | p50 | p90 | p99 | Min | Max |\n")
-                    f.write(f"|------|------|-----|-----|-----|-----|------|\n")
+                    f.write("| 指标 | Mean | p50 | p90 | p99 | Min | Max |\n")
+                    f.write("|------|------|-----|-----|-----|-----|------|\n")
                     f.write(f"| TTFT (ms) | {m['TTFT']['mean']:.1f} | {m['TTFT']['p50']:.1f} | {m['TTFT']['p90']:.1f} | {m['TTFT']['p99']:.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
                     f.write(f"| TPOT (ms) | {m['TPOT']['mean']:.1f} | {m['TPOT']['p50']:.1f} | {m['TPOT']['p90']:.1f} | {m['TPOT']['p99']:.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
                     f.write(f"| ITL (ms)  | {m['ITL']['mean']:.1f} | {m['ITL']['p50']:.1f} | {m['ITL']['p90']:.1f} | {m['ITL']['p99']:.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
@@ -458,16 +468,17 @@ def generate_report(all_results, results_dir, args, model_name):
                     f.write(f"- Output throughput: **{out_s:.1f} tok/s**\n")
                     f.write(f"- Total throughput: **{tot_s:.1f} tok/s**\n\n")
 
+                    tok_pr = round(1000 / m["TPOT"]["p50"], 1) if m["TPOT"]["p50"] > 0 else 0
                     csv_rows.append([
-                        scenario_name, "gsp",
-                        "2048+128", str(256),
+                        scenario_name, "single",
+                        str(run["params"].get("input_len", "")), str(run["params"].get("output_len", "")),
                         str(run["params"].get("concurrency", "")), "inf",
                         str(run["params"].get("prompts", "")), str(m["num_requests"]),
-                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p99']),
-                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p99']),
-                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p99']),
-                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p99']),
-                        str(out_s), str(tot_s),
+                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p90']), str(m['TTFT']['p99']),
+                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p90']), str(m['TPOT']['p99']),
+                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p90']), str(m['ITL']['p99']),
+                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p90']), str(m['E2E']['p99']),
+                        str(out_s), str(tot_s), str(tok_pr),
                     ])
 
             f.write("\n---\n\n")
@@ -475,34 +486,41 @@ def generate_report(all_results, results_dir, args, model_name):
         # ---- 瓶颈分析 ----
         f.write("## 瓶颈分析\n\n")
         f.write("### Prefill 瓶颈 (TTFT / input_len)\n\n")
-        f.write("TTFT 除以输入长度得到每个输入 token 的 prefill 时间，值越低 prefill 效率越高。\n\n")
+        f.write("TTFT 除以输入长度得到每个输入 token 的 prefill 时间 (ms/tok)，值越低 prefill 效率越高。\n\n")
 
-        # 从场景1抓数据
-        if "01_input_len_scan" in all_results:
-            f.write("| Input Len | TTFT(mean) ms | ms per input token |\n")
-            f.write("|-----------|---------------|--------------------|\n")
-            for run in all_results["01_input_len_scan"]:
-                if run and run["metrics"]:
-                    il = run["params"]["input_len"]
-                    ttft = run["metrics"]["TTFT"]["mean"]
-                    per_tok = ttft / il if il > 0 else 0
-                    f.write(f"| {il} | {ttft:.1f} | {per_tok:.4f} |\n")
-            f.write("\n")
+        # 从场景1抓 low-concurrency 数据（取 concur=1 的数据行）
+        for sn, runs in all_results.items():
+            if sn.startswith("01") and runs:
+                f.write("| Input Len | Concur | TTFT mean(ms) | ms per input token |\n")
+                f.write("|-----------|--------|---------------|--------------------|\n")
+                for run in runs:
+                    if run and run["metrics"] and run["params"].get("concurrency") == 1:
+                        il = run["params"]["input_len"]
+                        ttft = run["metrics"]["TTFT"]["mean"]
+                        per_tok = ttft / il if il > 0 else 0
+                        f.write(f"| {il} | {ttft:.0f} | {per_tok:.4f} |\n")
+                f.write("\n")
+                break
 
         f.write("### Decode 瓶颈 (TPOT)\n\n")
         f.write("TPOT 越低 decode 越快，单流吞吐 = 1000/TPOT(ms) tok/s。\n\n")
 
-        # 从场景3抓 decode 瓶颈
-        if "03_concurrency_scan" in all_results:
-            f.write("| Concurrency | TPOT(p50) ms | Tok/s per request |\n")
-            f.write("|-------------|--------------|--------------------|\n")
-            for run in all_results["03_concurrency_scan"]:
-                if run and run["metrics"]:
-                    conc = run["params"]["concurrency"]
-                    tpot_p50 = run["metrics"]["TPOT"]["p50"]
-                    single_tok_s = round(1000 / tpot_p50, 1) if tpot_p50 > 0 else 0
-                    f.write(f"| {conc} | {tpot_p50:.1f} | {single_tok_s} |\n")
-            f.write("\n")
+        # 从场景1抓 concur 变化对 TPOT 的影响（固定一个输入长度，如 1024）
+        for sn, runs in all_results.items():
+            if sn.startswith("01") and runs:
+                # 选输入长度 = 1024 的数据
+                f.write("| Concur | TPOT p50(ms) | Tok/s per request | Output tok/s (系统) |\n")
+                f.write("|--------|--------------|--------------------|----------------------|\n")
+                for run in runs:
+                    if run and run["metrics"] and run["params"].get("input_len") == 1024:
+                        conc = run["params"]["concurrency"]
+                        tpot = run["metrics"]["TPOT"]["p50"]
+                        single = round(1000 / tpot, 1) if tpot > 0 else 0
+                        sys_tok = run["metrics"]["output_throughput_tok_s"]
+                        conc_label = "∞" if conc == 0 else str(conc)
+                        f.write(f"| {conc_label} | {tpot:.1f} | {single} | {sys_tok:.1f} |\n")
+                f.write("\n")
+                break
 
         # ---- 结论 ----
         f.write("## 结论与建议\n\n")
@@ -621,10 +639,14 @@ def main():
 
     print(f"📋 测试计划 ({len(scenarios_to_run)} 个场景):")
     for name, sc in scenarios_to_run.items():
-        if sc["vary"]:
+        if sc.get("type") == "multi_vary":
+            total_tests = sum(len(g["concurrency"]) for g in sc["groups"])
             print(f"  [{name}] {sc['desc']}")
-            print(f"         {sc['vary']} ∈ {sc['values']}")
-            print(f"         固定参数: prompts={sc['fixed']['prompts']}, request_rate={sc['fixed']['request_rate']}")
+            print(f"         {total_tests} 个单测,  {len(sc['groups'])} 组输入长度")
+            for g in sc["groups"]:
+                tag = f" [{g['name']}]" if g.get("name") else ""
+                conc_str = ",".join(str(c) if c != 0 else "∞" for c in g["concurrency"])
+                print(f"           {g['input_len']:>7} tok{tag}  concur=[{conc_str}]  prompts={g.get('prompts', sc.get('prompts', 50))}")
         else:
             print(f"  [{name}] {sc['desc']} (单次)")
     print()
@@ -637,8 +659,8 @@ def main():
     all_results = OrderedDict()
     total_runs = 0
     for sc in scenarios_to_run.values():
-        if sc["vary"]:
-            total_runs += len(sc["values"])
+        if sc.get("type") == "multi_vary":
+            total_runs += sum(len(g["concurrency"]) for g in sc["groups"])
         else:
             total_runs += 1
 
@@ -651,29 +673,43 @@ def main():
         print(f"{'='*60}")
 
         runs = []
-
-        # 传递场景级 timeout 到 params
         scenario_timeout = scenario.get("timeout")
 
-        if scenario["vary"]:
-            for val in scenario["values"]:
-                run_count += 1
-                print(f"  [{run_count}/{total_runs}] ", end="")
-                params = dict(scenario["fixed"])
-                params["tokenizer"] = args.tokenizer
-                if not args.no_model_name:
-                    params["model"] = model_name
-                params[scenario["vary"]] = val
-                params["vary_name"] = val
-                if scenario_timeout:
-                    params["timeout"] = scenario_timeout
+        if scenario.get("type") == "multi_vary":
+            # ---- multi_vary: 遍历 groups → 每个 group 遍历 concurrency ----
+            for gi, group in enumerate(scenario["groups"]):
+                ilen = group["input_len"]
+                olen = scenario["output_len"]
+                group_prompts = group.get("prompts", scenario.get("prompts", 50))
+                tag = group.get("name", "")
 
-                result = run_benchmark(
-                    args, f"{scenario_name}_{val}", params,
-                    results_dir, args.random_ids, api_host_key,
-                )
-                runs.append(result)
-                time.sleep(0.5)  # 冷却
+                for ci, conc in enumerate(group["concurrency"]):
+                    run_count += 1
+                    conc_label = "∞" if conc == 0 else str(conc)
+                    desc = f"{tag}/{ilen}tok/concur={conc_label}" if tag else f"{ilen}tok/concur={conc_label}"
+                    print(f"  [{run_count}/{total_runs}] {desc}...", end=" ", flush=True)
+
+                    params = {
+                        "input_len": ilen,
+                        "output_len": olen,
+                        "concurrency": conc,
+                        "request_rate": scenario["request_rate"],
+                        "prompts": group_prompts,
+                        "vary_name": f"{ilen}_{conc}",
+                        "tokenizer": args.tokenizer,
+                    }
+                    if not args.no_model_name:
+                        params["model"] = model_name
+                    if scenario_timeout:
+                        params["timeout"] = scenario_timeout
+
+                    sfx = f"{scenario_name}_in{ilen}_c{conc}"
+                    result = run_benchmark(
+                        args, sfx, params,
+                        results_dir, args.random_ids, api_host_key,
+                    )
+                    runs.append(result)
+                    time.sleep(0.5)
         else:
             run_count += 1
             print(f"  [{run_count}/{total_runs}] ", end="")
@@ -681,7 +717,7 @@ def main():
             params["tokenizer"] = args.tokenizer
             if not args.no_model_name:
                 params["model"] = model_name
-            params["vary_name"] = "gsp"
+            params["vary_name"] = "single"
             if scenario_timeout:
                 params["timeout"] = scenario_timeout
 
