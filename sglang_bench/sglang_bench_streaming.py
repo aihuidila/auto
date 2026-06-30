@@ -64,22 +64,24 @@ SCENARIOS["04_rate_scan"] = {
 
 # ----- 场景 5: 前缀缓存压测（GSP） -----
 SCENARIOS["05_prefix_cache"] = {
-    "desc": "前缀缓存压测 — GSP: 64 groups × 16 prompts, system=2048, question=128",
+    "desc": "前缀缓存压测 — GSP: 32 groups × 16 prompts, system=2048, question=128",
     "fixed": {
-        "concurrency": 64, "request_rate": "inf", "prompts": 1024,
-        "gsp_groups": 64, "gsp_per_group": 16,
+        "concurrency": 64, "request_rate": "inf", "prompts": 512,
+        "gsp_groups": 32, "gsp_per_group": 16,
         "gsp_system": 2048, "gsp_question": 128, "gsp_output": 256,
     },
     "vary": None,
     "values": [None],  # single run
+    "timeout": 1800,  # 30 min for GSP
 }
 
 # ----- 场景 6: 大并发极限摸高（固定输入 1024，输出 128） -----
 SCENARIOS["06_stress_test"] = {
     "desc": "极限摸高 — input=1024, output=128, concurrency=128/256, burst",
-    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 500},
+    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 300},
     "vary": "concurrency",
     "values": [128, 256],
+    "timeout": 1200,  # 20 min for stress
 }
 
 
@@ -225,12 +227,13 @@ def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_
     desc_key = params.get("vary_name", "")
     print(f"    └─ {desc_key}...", end=" ", flush=True)
 
+    timeout = params.get("timeout", 600)
     start = time.time()
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=timeout,
     )
     elapsed = time.time() - start
     stdout = proc.stdout
@@ -584,6 +587,9 @@ def main():
 
         runs = []
 
+        # 传递场景级 timeout 到 params
+        scenario_timeout = scenario.get("timeout")
+
         if scenario["vary"]:
             for val in scenario["values"]:
                 run_count += 1
@@ -594,6 +600,8 @@ def main():
                     params["model"] = model_name
                 params[scenario["vary"]] = val
                 params["vary_name"] = val
+                if scenario_timeout:
+                    params["timeout"] = scenario_timeout
 
                 result = run_benchmark(
                     args, f"{scenario_name}_{val}", params,
@@ -609,6 +617,8 @@ def main():
             if not args.no_model_name:
                 params["model"] = model_name
             params["vary_name"] = "gsp"
+            if scenario_timeout:
+                params["timeout"] = scenario_timeout
 
             result = run_benchmark(
                 args, scenario_name, params,
