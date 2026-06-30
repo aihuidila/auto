@@ -41,16 +41,16 @@ SCENARIOS["01_input_len_scan"] = {
     # 场景级 timeout (每个单测另有各自 timeout)
     "timeout": 7200,
     "groups": [
-        {"name": "L1 短基线",  "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
-        {"name": "L2 短基线",  "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
-        {"name": "L2 中等",    "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128, 0],   "prompts": 100},
-        {"name": "",           "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64, 0],        "prompts": 80},
-        {"name": "",           "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32, 0],            "prompts": 60},
-        {"name": "",           "input_len": 65536,   "concurrency": [1, 4, 8, 16, 0],               "prompts": 50},
-        {"name": "",           "input_len": 131072,  "concurrency": [1, 4, 8, 0],                   "prompts": 40},
-        {"name": "L3 长",      "input_len": 262144,  "concurrency": [1, 4, 8],                      "prompts": 30},
-        {"name": "L4 超长",    "input_len": 524288,  "concurrency": [1, 4],                         "prompts": 20},
-        {"name": "L5 极限",    "input_len": 1048576, "concurrency": [1, 2],                         "prompts": 20},
+        {"name": "L1 短基线",  "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
+        {"name": "L2 短基线",  "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
+        {"name": "L2 中等",    "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128],   "prompts": 100},
+        {"name": "",           "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64],        "prompts": 80},
+        {"name": "",           "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32],            "prompts": 60},
+        {"name": "",           "input_len": 65536,   "concurrency": [1, 4, 8, 16],               "prompts": 50},
+        {"name": "",           "input_len": 131072,  "concurrency": [1, 4, 8],                   "prompts": 40},
+        {"name": "L3 长",      "input_len": 262144,  "concurrency": [1, 4, 8],                   "prompts": 30},
+        {"name": "L4 超长",    "input_len": 524288,  "concurrency": [1, 4],                      "prompts": 20},
+        {"name": "L5 极限",    "input_len": 1048576, "concurrency": [1, 2],                      "prompts": 20},
     ],
 }
 
@@ -112,23 +112,15 @@ def collect_jsonl_metrics(jsonl_path):
     ttft_s = {
         "mean": q(data, "mean_ttft_ms"),
         "p50":  q(data, "median_ttft_ms"),
-        "p90":  q(data, "p90_ttft_ms") or q(data, "p95_ttft_ms"),
         "p99":  q(data, "p99_ttft_ms"),
         "min":  min(ttft_list) if ttft_list else 0,
         "max":  max(ttft_list) if ttft_list else 0,
     }
 
     # TPOT: 无 per-request 列表，只从 summary 取
-    def tpot_p90():
-        v = q(data, "p90_tpot_ms")
-        if v:
-            return v
-        v = q(data, "p95_tpot_ms")
-        return v if v else 0
     tpot_s = {
         "mean": q(data, "mean_tpot_ms"),
         "p50":  q(data, "median_tpot_ms"),
-        "p90":  tpot_p90(),
         "p99":  q(data, "p99_tpot_ms"),
         "min":  q(data, "min_tpot_ms"),
         "max":  q(data, "max_tpot_ms"),
@@ -138,32 +130,24 @@ def collect_jsonl_metrics(jsonl_path):
     itl_s = {
         "mean": q(data, "mean_itl_ms"),
         "p50":  q(data, "median_itl_ms"),
-        "p90":  q(data, "p90_itl_ms") or q(data, "p95_itl_ms"),
         "p99":  q(data, "p99_itl_ms"),
         "min":  min(itl_list) if itl_list else 0,
         "max":  max(itl_list) if itl_list else 0,
     }
 
     # E2E: 无 per-request 列表
-    def e2e_p90():
-        v = q(data, "p90_e2e_latency_ms")
-        if v:
-            return v
-        v = q(data, "p95_e2e_latency_ms")
-        return v if v else 0
     e2e_s = {
         "mean": q(data, "mean_e2e_latency_ms"),
         "p50":  q(data, "median_e2e_latency_ms"),
-        "p90":  e2e_p90(),
         "p99":  q(data, "p99_e2e_latency_ms"),
         "min":  q(data, "min_e2e_latency_ms"),
         "max":  q(data, "max_e2e_latency_ms"),
     }
 
-    # 兜底：如果 summary 分位数缺失（p90=0），从原始列表重算
-    if ttft_s["p90"] == 0 and ttft_list:
+    # 兜底：如果 summary 全缺失，从原始列表重算
+    if ttft_s["mean"] == 0 and ttft_list:
         ttft_s = stats(ttft_list)
-    if itl_s["p90"] == 0 and itl_list:
+    if itl_s["mean"] == 0 and itl_list:
         itl_s = stats(itl_list)
 
     num_ok = q(data, "completed", 0)
@@ -355,10 +339,10 @@ def generate_report(all_results, results_dir, args, model_name):
         csv_header = [
             "scenario", "vary_param", "input_len", "output_len", "concurrency",
             "request_rate", "num_prompts", "successful",
-            "TTFT_mean", "TTFT_p50", "TTFT_p90", "TTFT_p99",
-            "TPOT_mean", "TPOT_p50", "TPOT_p90", "TPOT_p99",
-            "ITL_mean", "ITL_p50", "ITL_p90", "ITL_p99",
-            "E2E_mean", "E2E_p50", "E2E_p90", "E2E_p99",
+            "TTFT_mean", "TTFT_p50", "TTFT_p99",
+            "TPOT_mean", "TPOT_p50", "TPOT_p99",
+            "ITL_mean", "ITL_p50", "ITL_p99",
+            "E2E_mean", "E2E_p50", "E2E_p99",
             "output_tok_s", "total_tok_s", "tok_per_req",
         ]
         csv_rows.append(csv_header)
@@ -374,21 +358,20 @@ def generate_report(all_results, results_dir, args, model_name):
             # ---- multi_vary / vary 共用表格逻辑 ----
             if is_multi or scenario.get("vary"):
                 if is_multi:
-                    # 表头: Input Len | Concur | Reqs | ...
-                    hdr_cnt = 20
+                    hdr_cnt = 18
                     f.write("| Input Len | Concur | Reqs"
-                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
-                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
-                            " | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
-                            " | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
+                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p99(ms)"
+                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p99(ms)"
+                            " | ITL mean(ms) | ITL p50(ms) | ITL p99(ms)"
+                            " | E2E mean(ms) | E2E p50(ms) | E2E p99(ms)"
                             " | Output tok/s | Total tok/s | Tok/s per req |\n")
                 else:
-                    hdr_cnt = 18
+                    hdr_cnt = 16
                     f.write(f"| {scenario['vary']} | Reqs"
-                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p90(ms) | TTFT p99(ms)"
-                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p90(ms) | TPOT p99(ms)"
-                            " | ITL mean(ms) | ITL p50(ms) | ITL p90(ms) | ITL p99(ms)"
-                            " | E2E mean(ms) | E2E p50(ms) | E2E p90(ms) | E2E p99(ms)"
+                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p99(ms)"
+                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p99(ms)"
+                            " | ITL mean(ms) | ITL p50(ms) | ITL p99(ms)"
+                            " | E2E mean(ms) | E2E p50(ms) | E2E p99(ms)"
                             " | Output tok/s | Total tok/s | Tok/s per req |\n")
                 f.write("|" + "---|" * hdr_cnt + "\n")
 
@@ -411,10 +394,10 @@ def generate_report(all_results, results_dir, args, model_name):
                     tok_per_req = round(1000 / tp["p50"], 1) if tp["p50"] > 0 else 0
 
                     metric_cols = (
-                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p90']:.0f} | {t['p99']:.0f}"
-                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p90']:.1f} | {tp['p99']:.1f}"
-                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p90']:.1f} | {it['p99']:.1f}"
-                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p90']:.0f} | {e2['p99']:.0f}"
+                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p99']:.0f}"
+                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p99']:.1f}"
+                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p99']:.1f}"
+                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p99']:.0f}"
                         f" | {out_tok_s:.1f} | {tot_tok_s:.1f} | {tok_per_req}"
                     )
 
