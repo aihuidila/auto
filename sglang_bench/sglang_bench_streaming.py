@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""
+SGLang 模型性能压测脚本 — 通过 /v1/chat/completions 端点进行流式推理
+支持多场景矩阵测试，输出完整压测报告
+
+用法:
+  # 有 ShareGPT 缓存（推荐，生成有意义文本）
+  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results
+
+  # 离线环境（随机 token ID，无需任何网络）
+  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --random-ids
+
+依赖:
+  pip install numpy
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import OrderedDict
+from datetime import datetime
+
+# ─────────────────────────────────────────────
+# 配置区
+# ─────────────────────────────────────────────
+SCENARIOS = OrderedDict()
+
+# ----- 场景 1: 输入长度扫描（固定输出 128，并发 8） -----
+SCENARIOS["01_input_len_scan"] = {
+    "desc": "输入长度扫描 — 固定 output_len=128, concurrency=8",
+    "fixed": {"output_len": 128, "concurrency": 8, "request_rate": "inf", "prompts": 200},
+    "vary": "input_len",
+    "values": [128, 512, 1024, 2048, 4096],
+}
+
+# ----- 场景 2: 输出长度扫描（固定输入 1024，并发 8） -----
+SCENARIOS["02_output_len_scan"] = {
+    "desc": "输出长度扫描 — 固定 input_len=1024, concurrency=8",
+    "fixed": {"input_len": 1024, "concurrency": 8, "request_rate": "inf", "prompts": 200},
+    "vary": "output_len",
+    "values": [64, 128, 256, 512],
+}
+
+# ----- 场景 3: 并发扩展（固定输入 1024，输出 128） -----
+SCENARIOS["03_concurrency_scan"] = {
+    "desc": "并发扩展 — 固定 input_len=1024, output_len=128, burst",
+    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 200},
+    "vary": "concurrency",
+    "values": [1, 4, 8, 16, 32, 64],
+}
+
+# ----- 场景 4: 请求速率扫描（固定输入 1024，输出 128，并发 64） -----
+SCENARIOS["04_rate_scan"] = {
+    "desc": "请求速率扫描 — 固定 input_len=1024, output_len=128, concurrency=64",
+    "fixed": {"input_len": 1024, "output_len": 128, "concurrency": 64, "prompts": 500, "request_rate": "inf"},
+    "vary": "request_rate",
+    "values": ["inf", 50, 20, 10, 5],
+}
+
+# ----- 场景 5: 前缀缓存压测（GSP） -----
+SCENARIOS["05_prefix_cache"] = {
+    "desc": "前缀缓存压测 — GSP: 64 groups × 16 prompts, system=2048, question=128",
+    "fixed": {
+        "concurrency": 64, "request_rate": "inf", "prompts": 1024,
+        "gsp_groups": 64, "gsp_per_group": 16,
+        "gsp_system": 2048, "gsp_question": 128, "gsp_output": 256,
+    },
+    "vary": None,
+    "values": [None],  # single run
+}
+
+# ----- 场景 6: 大并发极限摸高（固定输入 1024，输出 128） -----
+SCENARIOS["06_stress_test"] = {
+    "desc": "极限摸高 — input=1024, output=128, concurrency=128/256, burst",
+    "fixed": {"input_len": 1024, "output_len": 128, "request_rate": "inf", "prompts": 500},
+    "vary": "concurrency",
+    "values": [128, 256],
+}
+
+
+# ─────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────
+
+def stats(arr):
+    """计算 Mean / p50 / p90 / p99 / Min / Max"""
+    if not arr:
+        return {"mean": 0, "p50": 0, "p90": 0, "p99": 0, "min": 0, "max": 0}
+    s = sorted(arr)
+    n = len(s)
+    return {
+        "mean": round(sum(s) / n, 2),
+        "p50":  round(s[n // 2], 2),
+        "p90":  round(s[int(n * 0.90)], 2),
+        "p99":  round(s[int(n * 0.99)], 2),
+        "min":  round(s[0], 2),
+        "max":  round(s[-1], 2),
+    }
+
+
+def collect_jsonl_metrics(jsonl_path):
+    """从 bench_serving 输出的 JSONL 文件收集每个请求的延迟指标"""
+    records = []
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+    except FileNotFoundError:
+        return None
+
+    if not records:
+        return None
+
+    ttfts = [r.get("ttft", 0) * 1000 for r in records if r.get("ttft") is not None]
+    tpots = [r.get("tpot", 0) * 1000 for r in records if r.get("tpot") is not None]
+    itls  = [r.get("itl", 0) * 1000 for r in records if r.get("itl") is not None]
+    e2es  = [r.get("e2e_latency", 0) * 1000 for r in records if r.get("e2e_latency") is not None]
+
+    output_tokens = [r.get("output_tokens", 0) for r in records if r.get("output_tokens") is not None]
+    input_tokens  = [r.get("input_tokens", 0) for r in records if r.get("input_tokens") is not None]
+
+    total_output = sum(output_tokens)
+    total_input  = sum(input_tokens)
+    num_ok = len(records)
+    duration_s = (max(e2es) / 1000) if e2es else 1  # wall time ≈ max e2e
+
+    result = {
+        "num_requests": num_ok,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_tokens": total_input + total_output,
+        "throughput_tok_s": round((total_input + total_output) / duration_s, 2) if duration_s else 0,
+        "output_throughput_tok_s": round(total_output / duration_s, 2) if duration_s else 0,
+        "TTFT": stats(ttfts),
+        "TPOT": stats(tpots),
+        "ITL":  stats(itls),
+        "E2E":  stats(e2es),
+    }
+
+    # 也捕获 stdout 中的吞吐信息（比上面算的准确）
+    return result
+
+
+def parse_stdout_summary(stdout):
+    """从 bench_serving 的 stdout 中摘取吞吐 summary"""
+    result = {}
+    patterns = [
+        (r"Request throughput \(req/s\):\s+([\d.]+)", "req_throughput"),
+        (r"Output token throughput \(tok/s\):\s+([\d.]+)", "output_tok_s"),
+        (r"Total token throughput \(tok/s\):\s+([\d.]+)", "total_tok_s"),
+        (r"Benchmark duration \(s\):\s+([\d.]+)", "duration_s"),
+        (r"Successful requests:\s+(\d+)", "successful_requests"),
+        (r"Concurrency:\s+([\d.]+)", "concurrency_avg"),
+        (r"Peak concurrent requests:\s+(\d+)", "concurrency_peak"),
+    ]
+    for pat, key in patterns:
+        m = re.search(pat, stdout)
+        if m:
+            result[key] = float(m.group(1)) if "." in m.group(1) else int(m.group(1))
+    return result
+
+
+# ─────────────────────────────────────────────
+# 核心压测函数
+# ─────────────────────────────────────────────
+
+def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_host_key):
+    """
+    执行一次 bench_serving 并返回解析后的指标
+    """
+    host, port = api_host_key
+    result_file = os.path.join(results_dir, f"{scenario_name}.jsonl")
+
+    cmd = [
+        sys.executable, "-m", "sglang.bench_serving",
+        "--backend", "sglang-oai-chat",
+        "--host", host,
+        "--port", str(port),
+        "--tokenizer", params["tokenizer"],
+        "--num-prompts", str(params["prompts"]),
+        "--request-rate", str(params["request_rate"]),
+        "--max-concurrency", str(params["concurrency"]),
+        "--output-file", result_file,
+        "--output-details",
+        "--warmup-requests", "10",
+        "--disable-tqdm",
+        "--apply-chat-template",
+        # 注意: 不加 --disable-stream，保持流式
+    ]
+
+    if params.get("model"):
+        cmd += ["--model", params["model"]]
+
+    # ---- 数据集参数 ----
+    if params.get("gsp_groups"):
+        # GSP 场景
+        cmd += [
+            "--dataset-name", "generated-shared-prefix",
+            "--gsp-num-groups", str(params["gsp_groups"]),
+            "--gsp-prompts-per-group", str(params["gsp_per_group"]),
+            "--gsp-system-prompt-len", str(params["gsp_system"]),
+            "--gsp-question-len", str(params["gsp_question"]),
+            "--gsp-output-len", str(params["gsp_output"]),
+        ]
+    else:
+        # 普通场景
+        dataset_name = "random-ids" if use_random_ids else "random"
+        cmd += [
+            "--dataset-name", dataset_name,
+            "--random-input-len", str(params["input_len"]),
+            "--random-output-len", str(params["output_len"]),
+        ]
+
+    # 打印命令（精简版）
+    desc_key = params.get("vary_name", "")
+    print(f"    └─ {desc_key}...", end=" ", flush=True)
+
+    start = time.time()
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    elapsed = time.time() - start
+    stdout = proc.stdout
+    stderr = proc.stderr
+
+    if proc.returncode != 0:
+        print(f"✗ (exit={proc.returncode}, {elapsed:.0f}s)")
+        # 打印错误摘要
+        err_lines = stderr.strip().split("\n")[-5:]
+        for line in err_lines:
+            if line.strip():
+                print(f"      {line.strip()}")
+        return None
+
+    print(f"✓ ({elapsed:.0f}s)")
+
+    # 解析结果
+    metrics = collect_jsonl_metrics(result_file)
+    summary = parse_stdout_summary(stdout)
+
+    result = {"params": params, "metrics": metrics, "summary": summary, "file": result_file}
+    return result
+
+
+# ─────────────────────────────────────────────
+# 报告生成
+# ─────────────────────────────────────────────
+
+def format_value(v, unit=""):
+    """格式化数值，避免 .00"""
+    if isinstance(v, float):
+        if v == int(v):
+            return f"{int(v)}{unit}"
+        return f"{v:.2f}{unit}"
+    return f"{v}{unit}"
+
+
+def print_metric_row(name, metrics_dict, unit="ms"):
+    if not metrics_dict:
+        return f"  {name:<10}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}\n"
+    d = metrics_dict
+    return (
+        f"  {name:<10}"
+        f"  {d['mean']:>8.1f}"
+        f"  {d['p50']:>8.1f}"
+        f"  {d['p90']:>8.1f}"
+        f"  {d['p99']:>8.1f}"
+        f"  {d['min']:>8.1f}"
+        f"  {d['max']:>8.1f}\n"
+    )
+
+
+def generate_report(all_results, results_dir, args, model_name):
+    """生成完整的压测报告 Markdown 文件"""
+    report_path = os.path.join(results_dir, "bench_report.md")
+    csv_path = os.path.join(results_dir, "all_results.csv")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("# SGLang 模型性能压测报告\n\n")
+        f.write(f"- **测试时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"- **API 端点**: {args.api_url}/v1/chat/completions (流式)\n")
+        f.write(f"- **模型**: {model_name}\n")
+        f.write(f"- **Tokenizer**: {args.tokenizer}\n")
+        f.write(f"- **Backend**: sglang-oai-chat\n")
+        f.write(f"- **数据集**: {'random-ids (离线随机ID)' if args.random_ids else 'random (ShareGPT采样文本)'}\n")
+        f.write(f"- **流式**: 是\n\n")
+
+        f.write("---\n\n## 指标说明\n\n")
+        f.write("| 指标 | 含义 |\n")
+        f.write("|------|------|\n")
+        f.write("| **TTFT** | Time To First Token — 首 token 延迟，反映 prefill 速度 |\n")
+        f.write("| **TPOT** | Time Per Output Token — 每个输出 token 平均耗时，反映 decode 速度 |\n")
+        f.write("| **ITL** | Inter-Token Latency — token 间延迟抖动，反映流式平滑度 |\n")
+        f.write("| **E2E** | End-to-End Latency — 请求总完成时间 |\n")
+        f.write("| **tok/s** | Output token throughput — 每秒输出 token 数 |\n\n")
+
+        f.write("---\n\n")
+
+        # CSV header
+        csv_rows = []
+        csv_header = [
+            "scenario", "vary_param", "input_len", "output_len", "concurrency",
+            "request_rate", "num_prompts", "successful",
+            "TTFT_mean", "TTFT_p50", "TTFT_p99",
+            "TPOT_mean", "TPOT_p50", "TPOT_p99",
+            "ITL_mean", "ITL_p50", "ITL_p99",
+            "E2E_mean", "E2E_p50", "E2E_p99",
+            "output_tok_s", "total_tok_s",
+        ]
+        csv_rows.append(csv_header)
+
+        for scenario_name, runs in all_results.items():
+            if not runs:
+                continue
+            scenario = SCENARIOS[scenario_name]
+            f.write(f"## {scenario_name}: {scenario['desc']}\n\n")
+
+            if scenario.get("vary"):
+                f.write(f"| {scenario['vary']} | Reqs | TTFT(mean) | TTFT(p50) | TTFT(p99) | TPOT(mean) | TPOT(p50) | TPOT(p99) | ITL(mean) | ITL(p50) | ITL(p99) | E2E(mean) | E2E(p50) | E2E(p99) | Output tok/s | Total tok/s |\n")
+                f.write("|" + "---|" * 16 + "\n")
+
+                for run in runs:
+                    if run is None:
+                        continue
+                    p = run["params"]
+                    vary_val = p.get("vary_name", "")
+                    m = run["metrics"]
+                    s = run["summary"]
+                    if m is None:
+                        f.write(f"| {vary_val} | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |\n")
+                        continue
+
+                    reqs = m["num_requests"]
+                    t = m["TTFT"]
+                    tp = m["TPOT"]
+                    it = m["ITL"]
+                    e2 = m["E2E"]
+                    out_tok_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
+                    tot_tok_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
+
+                    f.write(
+                        f"| {vary_val} | {reqs}"
+                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p99']:.0f}"
+                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p99']:.1f}"
+                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p99']:.1f}"
+                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p99']:.0f}"
+                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} |\n"
+                    )
+
+                    csv_rows.append([
+                        scenario_name, str(vary_val),
+                        str(p.get("input_len", "")), str(p.get("output_len", "")),
+                        str(p.get("concurrency", "")), str(p.get("request_rate", "")),
+                        str(p.get("prompts", "")), str(reqs),
+                        str(t['mean']), str(t['p50']), str(t['p99']),
+                        str(tp['mean']), str(tp['p50']), str(tp['p99']),
+                        str(it['mean']), str(it['p50']), str(it['p99']),
+                        str(e2['mean']), str(e2['p50']), str(e2['p99']),
+                        str(out_tok_s), str(tot_tok_s),
+                    ])
+            else:
+                # 单次运行场景（如 GSP）
+                run = runs[0] if runs else None
+                if run and run["metrics"]:
+                    m = run["metrics"]
+                    s = run["summary"]
+                    f.write("### 结果\n\n")
+                    f.write(f"| 指标 | Mean | p50 | p90 | p99 | Min | Max |\n")
+                    f.write(f"|------|------|-----|-----|-----|-----|------|\n")
+                    f.write(f"| TTFT (ms) | {m['TTFT']['mean']:.1f} | {m['TTFT']['p50']:.1f} | {m['TTFT']['p90']:.1f} | {m['TTFT']['p99']:.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
+                    f.write(f"| TPOT (ms) | {m['TPOT']['mean']:.1f} | {m['TPOT']['p50']:.1f} | {m['TPOT']['p90']:.1f} | {m['TPOT']['p99']:.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
+                    f.write(f"| ITL (ms)  | {m['ITL']['mean']:.1f} | {m['ITL']['p50']:.1f} | {m['ITL']['p90']:.1f} | {m['ITL']['p99']:.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
+                    f.write(f"| E2E (ms)  | {m['E2E']['mean']:.1f} | {m['E2E']['p50']:.1f} | {m['E2E']['p90']:.1f} | {m['E2E']['p99']:.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
+                    out_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
+                    tot_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
+                    f.write(f"- Requests: {m['num_requests']}\n")
+                    f.write(f"- Output throughput: **{out_s:.1f} tok/s**\n")
+                    f.write(f"- Total throughput: **{tot_s:.1f} tok/s**\n\n")
+
+                    csv_rows.append([
+                        scenario_name, "gsp",
+                        "2048+128", str(256),
+                        str(run["params"].get("concurrency", "")), "inf",
+                        str(run["params"].get("prompts", "")), str(m["num_requests"]),
+                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p99']),
+                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p99']),
+                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p99']),
+                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p99']),
+                        str(out_s), str(tot_s),
+                    ])
+
+            f.write("\n---\n\n")
+
+        # ---- 瓶颈分析 ----
+        f.write("## 瓶颈分析\n\n")
+        f.write("### Prefill 瓶颈 (TTFT / input_len)\n\n")
+        f.write("TTFT 除以输入长度得到每个输入 token 的 prefill 时间，值越低 prefill 效率越高。\n\n")
+
+        # 从场景1抓数据
+        if "01_input_len_scan" in all_results:
+            f.write("| Input Len | TTFT(mean) ms | ms per input token |\n")
+            f.write("|-----------|---------------|--------------------|\n")
+            for run in all_results["01_input_len_scan"]:
+                if run and run["metrics"]:
+                    il = run["params"]["input_len"]
+                    ttft = run["metrics"]["TTFT"]["mean"]
+                    per_tok = ttft / il if il > 0 else 0
+                    f.write(f"| {il} | {ttft:.1f} | {per_tok:.4f} |\n")
+            f.write("\n")
+
+        f.write("### Decode 瓶颈 (TPOT)\n\n")
+        f.write("TPOT 越低 decode 越快，单流吞吐 = 1000/TPOT(ms) tok/s。\n\n")
+
+        # 从场景3抓 decode 瓶颈
+        if "03_concurrency_scan" in all_results:
+            f.write("| Concurrency | TPOT(p50) ms | Tok/s per request |\n")
+            f.write("|-------------|--------------|--------------------|\n")
+            for run in all_results["03_concurrency_scan"]:
+                if run and run["metrics"]:
+                    conc = run["params"]["concurrency"]
+                    tpot_p50 = run["metrics"]["TPOT"]["p50"]
+                    single_tok_s = round(1000 / tpot_p50, 1) if tpot_p50 > 0 else 0
+                    f.write(f"| {conc} | {tpot_p50:.1f} | {single_tok_s} |\n")
+            f.write("\n")
+
+        # ---- 结论 ----
+        f.write("## 结论与建议\n\n")
+        f.write("1. **最大吞吐**: ")
+        max_tok_s = 0
+        max_scenario = ""
+        for scenario_name, runs in all_results.items():
+            for run in runs:
+                if run and run.get("summary"):
+                    ts = run["summary"].get("total_tok_s", 0)
+                    if ts > max_tok_s:
+                        max_tok_s = ts
+                        max_scenario = scenario_name
+        f.write(f"系统总吞吐峰值 **{max_tok_s:.1f} tok/s**（场景: {max_scenario}）\n")
+        f.write("2. 建议生产环境并发控制在 TTFT 开始显著恶化的拐点以下\n")
+        f.write("3. 具体调优方向请结合上述分场景数据\n\n")
+
+        f.write("---\n")
+        f.write(f"报告自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  原始数据: `result_*.jsonl`\n")
+
+    # 写 CSV
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        for row in csv_rows:
+            writer.writerow(row)
+
+    print(f"\n  📄 报告: {report_path}")
+    print(f"  📊 数据: {csv_path}")
+    return report_path
+
+
+# ─────────────────────────────────────────────
+# 主函数
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SGLang 模型性能压测 — /v1/chat/completions 流式推理",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  # 有 ShareGPT 缓存
+  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results
+
+  # 离线（纯随机 ID）
+  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --random-ids
+
+  # 只跑指定场景（逗号分隔）
+  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --only 01,03
+        """,
+    )
+    parser.add_argument("api_url", help="SGLang 服务地址，如 http://localhost:30000")
+    parser.add_argument("tokenizer", help="Tokenizer 路径或模型名")
+    parser.add_argument("output_dir", nargs="?", default="./bench_results", help="输出目录 (默认: ./bench_results)")
+    parser.add_argument("--random-ids", action="store_true", help="使用 random-ids 数据集（离线兼容，无需网络）")
+    parser.add_argument("--only", help="只跑指定场景编号，逗号分隔 如 01,03")
+    parser.add_argument("--no-model-name", action="store_true", help="不传 --model 参数（服务端自动识别）")
+    parser.add_argument("--dry-run", action="store_true", help="只打印命令，不实际执行")
+    args = parser.parse_args()
+
+    # 解析 API URL
+    api_url = args.api_url.rstrip("/")
+    api_url_clean = api_url.replace("http://", "").replace("https://", "")
+    api_url_clean = api_url_clean.replace("/v1", "").replace("/chat/completions", "")
+    if ":" in api_url_clean:
+        host, port = api_url_clean.split(":")
+        port = int(port)
+    else:
+        host = api_url_clean
+        port = 80
+
+    api_host_key = (host, port)
+
+    # 检查服务可用
+    model_name = "unknown"
+    if args.dry_run:
+        model_name = "<model-from-server>"
+        print("  [dry-run] 跳过服务检查")
+    else:
+        print("🔍 检查服务可用性...", end=" ", flush=True)
+        ret = os.system(f"curl -sf {api_url}/health > /dev/null 2>&1")
+        if ret != 0:
+            print(f"✗ 端点不可用: {api_url}/health")
+            ret = os.system(f"curl -sf {api_url}/v1/models > /dev/null 2>&1")
+            if ret != 0:
+                print(f"✗ 无法连接: {api_url}")
+                sys.exit(1)
+        print("✓")
+
+        try:
+            r = subprocess.run(
+                ["curl", "-sf", f"{api_url}/v1/models"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                data = json.loads(r.stdout)
+                model_name = data.get("data", [{}])[0].get("id", "unknown")
+        except Exception:
+            pass
+    print(f"  🧠 模型: {model_name}\n")
+
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = os.path.join(args.output_dir, timestamp)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # 筛选场景
+    if args.only:
+        selected = set(args.only.split(","))
+        scenarios_to_run = OrderedDict(
+            (k, v) for k, v in SCENARIOS.items()
+            if any(k.startswith(s) for s in selected)
+        )
+    else:
+        scenarios_to_run = SCENARIOS
+
+    print(f"📋 测试计划 ({len(scenarios_to_run)} 个场景):")
+    for name, sc in scenarios_to_run.items():
+        if sc["vary"]:
+            print(f"  [{name}] {sc['desc']}")
+            print(f"         {sc['vary']} ∈ {sc['values']}")
+            print(f"         固定参数: prompts={sc['fixed']['prompts']}, request_rate={sc['fixed']['request_rate']}")
+        else:
+            print(f"  [{name}] {sc['desc']} (单次)")
+    print()
+
+    if args.dry_run:
+        print("🏁 Dry-run 模式，不执行。")
+        return
+
+    # 执行测试
+    all_results = OrderedDict()
+    total_runs = 0
+    for sc in scenarios_to_run.values():
+        if sc["vary"]:
+            total_runs += len(sc["values"])
+        else:
+            total_runs += 1
+
+    run_count = 0
+
+    for scenario_name, scenario in scenarios_to_run.items():
+        print(f"\n{'='*60}")
+        print(f" 场景: {scenario_name}")
+        print(f" {scenario['desc']}")
+        print(f"{'='*60}")
+
+        runs = []
+
+        if scenario["vary"]:
+            for val in scenario["values"]:
+                run_count += 1
+                print(f"  [{run_count}/{total_runs}] ", end="")
+                params = dict(scenario["fixed"])
+                params["tokenizer"] = args.tokenizer
+                if not args.no_model_name:
+                    params["model"] = model_name
+                params[scenario["vary"]] = val
+                params["vary_name"] = val
+
+                result = run_benchmark(
+                    args, f"{scenario_name}_{val}", params,
+                    results_dir, args.random_ids, api_host_key,
+                )
+                runs.append(result)
+                time.sleep(0.5)  # 冷却
+        else:
+            run_count += 1
+            print(f"  [{run_count}/{total_runs}] ", end="")
+            params = dict(scenario["fixed"])
+            params["tokenizer"] = args.tokenizer
+            if not args.no_model_name:
+                params["model"] = model_name
+            params["vary_name"] = "gsp"
+
+            result = run_benchmark(
+                args, scenario_name, params,
+                results_dir, args.random_ids, api_host_key,
+            )
+            runs.append(result)
+            time.sleep(0.5)
+
+        all_results[scenario_name] = runs
+
+        # 打印该场景摘要
+        for run in runs:
+            if run and run["metrics"] and run["summary"]:
+                s = run["summary"]
+                tok = s.get("output_tok_s", "—")
+                print(f"      → req={s.get('successful_requests','—')}  out_tok/s={tok}")
+
+    # 生成报告
+    print(f"\n{'='*60}")
+    print(f" 生成报告...")
+    print(f"{'='*60}")
+    report = generate_report(all_results, results_dir, args, model_name)
+
+    # 打印报告路径和摘要
+    csv_path = os.path.join(results_dir, "all_results.csv")
+    print(f"\n✅ 测试完成！结果目录: {results_dir}")
+    print(f"   📄 报告: {report}")
+    print(f"   📊 CSV:  {csv_path}")
+    print(f"   📁 JSONL: {results_dir}/*.jsonl")
+
+
+if __name__ == "__main__":
+    main()
