@@ -106,50 +106,98 @@ def stats(arr):
 
 
 def collect_jsonl_metrics(jsonl_path):
-    """从 bench_serving 输出的 JSONL 文件收集每个请求的延迟指标"""
-    records = []
+    """从 bench_serving 输出的 JSONL 文件提取延迟指标
+
+    JSONL 格式是单个 JSON 对象包含 summary 字段（mean/p50/p90/p99）
+    和 per-request 列表字段（ttfts: [...], itls: [...]）。
+    """
     try:
         with open(jsonl_path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-    except FileNotFoundError:
+            content = f.read().strip()
+            if not content:
+                return None
+            data = json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-    if not records:
+    if not data:
         return None
 
-    ttfts = [r.get("ttft", 0) * 1000 for r in records if r.get("ttft") is not None]
-    tpots = [r.get("tpot", 0) * 1000 for r in records if r.get("tpot") is not None]
-    itls  = [r.get("itl", 0) * 1000 for r in records if r.get("itl") is not None]
-    e2es  = [r.get("e2e_latency", 0) * 1000 for r in records if r.get("e2e_latency") is not None]
+    # 直接使用 SGLang 已经算好的分位数（单位 ms）
+    def safe(d, key, default=0):
+        return d.get(key, default) or default
 
-    output_tokens = [r.get("output_tokens", 0) for r in records if r.get("output_tokens") is not None]
-    input_tokens  = [r.get("input_tokens", 0) for r in records if r.get("input_tokens") is not None]
+    # TTFT
+    ttft_s = {
+        "mean": safe(data, "mean_ttft_ms"),
+        "p50":  safe(data, "median_ttft_ms"),
+        "p90":  safe(data, "p90_ttft_ms"),
+        "p99":  safe(data, "p99_ttft_ms"),
+        "min":  safe(data, "min_ttft_ms", safe(data, "min_ttft_s", 0) * 1000),
+        "max":  safe(data, "max_ttft_ms", safe(data, "max_ttft_s", 0) * 1000),
+    }
 
-    total_output = sum(output_tokens)
-    total_input  = sum(input_tokens)
-    num_ok = len(records)
-    duration_s = (max(e2es) / 1000) if e2es else 1  # wall time ≈ max e2e
+    # TPOT
+    tpot_s = {
+        "mean": safe(data, "mean_tpot_ms"),
+        "p50":  safe(data, "median_tpot_ms"),
+        "p90":  safe(data, "p90_tpot_ms"),
+        "p99":  safe(data, "p99_tpot_ms"),
+        "min":  safe(data, "min_tpot_ms", safe(data, "min_tpot_s", 0) * 1000),
+        "max":  safe(data, "max_tpot_ms", safe(data, "max_tpot_s", 0) * 1000),
+    }
+
+    # ITL
+    itl_s = {
+        "mean": safe(data, "mean_itl_ms"),
+        "p50":  safe(data, "median_itl_ms"),
+        "p90":  safe(data, "p90_itl_ms"),
+        "p99":  safe(data, "p99_itl_ms"),
+        "min":  safe(data, "min_itl_ms", safe(data, "min_itl_s", 0) * 1000),
+        "max":  safe(data, "max_itl_ms", safe(data, "max_itl_s", 0) * 1000),
+    }
+
+    # E2E
+    e2e_s = {
+        "mean": safe(data, "mean_e2e_latency_ms"),
+        "p50":  safe(data, "median_e2e_latency_ms"),
+        "p90":  safe(data, "p90_e2e_latency_ms"),
+        "p99":  safe(data, "p99_e2e_latency_ms"),
+        "min":  safe(data, "min_e2e_latency_ms", safe(data, "min_e2e_latency_s", 0) * 1000),
+        "max":  safe(data, "max_e2e_latency_ms", safe(data, "max_e2e_latency_s", 0) * 1000),
+    }
+
+    # 备用：如果 summary 里没有分位数（旧版本 SGLang），从 per-request 列表算
+    ttfts_raw = data.get("ttfts")
+    if ttfts_raw and isinstance(ttfts_raw, list) and len(ttfts_raw) > 0 and ttft_s["mean"] == 0:
+        ttft_list = [t * 1000 for t in ttfts_raw if t is not None]
+        if ttft_list:
+            ttft_s = stats(ttft_list)
+
+    itls_raw = data.get("itls")
+    if itls_raw and isinstance(itls_raw, list) and len(itls_raw) > 0 and itl_s["mean"] == 0:
+        itl_list = [t * 1000 for t in itls_raw if t is not None]
+        if itl_list:
+            itl_s = stats(itl_list)
+
+    num_ok = data.get("completed", 0)
+    total_input = data.get("total_input_tokens", 0) or data.get("total_input_text_tokens", 0)
+    total_output = data.get("total_output_tokens", 0)
+    duration_s = data.get("duration", 1) or 1
 
     result = {
-        "num_requests": num_ok,
+        "num_requests": num_ok or len(ttfts_raw) if isinstance(ttfts_raw, list) else 0,
         "total_input_tokens": total_input,
         "total_output_tokens": total_output,
         "total_tokens": total_input + total_output,
-        "throughput_tok_s": round((total_input + total_output) / duration_s, 2) if duration_s else 0,
-        "output_throughput_tok_s": round(total_output / duration_s, 2) if duration_s else 0,
-        "TTFT": stats(ttfts),
-        "TPOT": stats(tpots),
-        "ITL":  stats(itls),
-        "E2E":  stats(e2es),
+        "throughput_tok_s": safe(data, "total_throughput", round((total_input + total_output) / duration_s, 2)),
+        "output_throughput_tok_s": safe(data, "output_throughput", round(total_output / duration_s, 2)),
+        "TTFT": ttft_s,
+        "TPOT": tpot_s,
+        "ITL":  itl_s,
+        "E2E":  e2e_s,
     }
 
-    # 也捕获 stdout 中的吞吐信息（比上面算的准确）
     return result
 
 
