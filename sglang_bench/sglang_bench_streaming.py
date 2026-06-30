@@ -123,75 +123,91 @@ def collect_jsonl_metrics(jsonl_path):
     if not data:
         return None
 
-    # 直接使用 SGLang 已经算好的分位数（单位 ms）
-    def safe(d, key, default=0):
-        return d.get(key, default) or default
-
-    # TTFT
-    ttft_s = {
-        "mean": safe(data, "mean_ttft_ms"),
-        "p50":  safe(data, "median_ttft_ms"),
-        "p90":  safe(data, "p90_ttft_ms"),
-        "p99":  safe(data, "p99_ttft_ms"),
-        "min":  safe(data, "min_ttft_ms", safe(data, "min_ttft_s", 0) * 1000),
-        "max":  safe(data, "max_ttft_ms", safe(data, "max_ttft_s", 0) * 1000),
-    }
-
-    # TPOT
-    tpot_s = {
-        "mean": safe(data, "mean_tpot_ms"),
-        "p50":  safe(data, "median_tpot_ms"),
-        "p90":  safe(data, "p90_tpot_ms"),
-        "p99":  safe(data, "p99_tpot_ms"),
-        "min":  safe(data, "min_tpot_ms", safe(data, "min_tpot_s", 0) * 1000),
-        "max":  safe(data, "max_tpot_ms", safe(data, "max_tpot_s", 0) * 1000),
-    }
-
-    # ITL
-    itl_s = {
-        "mean": safe(data, "mean_itl_ms"),
-        "p50":  safe(data, "median_itl_ms"),
-        "p90":  safe(data, "p90_itl_ms"),
-        "p99":  safe(data, "p99_itl_ms"),
-        "min":  safe(data, "min_itl_ms", safe(data, "min_itl_s", 0) * 1000),
-        "max":  safe(data, "max_itl_ms", safe(data, "max_itl_s", 0) * 1000),
-    }
-
-    # E2E
-    e2e_s = {
-        "mean": safe(data, "mean_e2e_latency_ms"),
-        "p50":  safe(data, "median_e2e_latency_ms"),
-        "p90":  safe(data, "p90_e2e_latency_ms"),
-        "p99":  safe(data, "p99_e2e_latency_ms"),
-        "min":  safe(data, "min_e2e_latency_ms", safe(data, "min_e2e_latency_s", 0) * 1000),
-        "max":  safe(data, "max_e2e_latency_ms", safe(data, "max_e2e_latency_s", 0) * 1000),
-    }
-
-    # 备用：如果 summary 里没有分位数（旧版本 SGLang），从 per-request 列表算
+    # 从 per-request 列表提取 min/max（TTFT 和 ITL 有列表，TPOT/E2E 没有）
     ttfts_raw = data.get("ttfts")
-    if ttfts_raw and isinstance(ttfts_raw, list) and len(ttfts_raw) > 0 and ttft_s["mean"] == 0:
+    if isinstance(ttfts_raw, list) and len(ttfts_raw) > 0:
         ttft_list = [t * 1000 for t in ttfts_raw if t is not None]
-        if ttft_list:
-            ttft_s = stats(ttft_list)
+        itls_raw = data.get("itls")
+        itl_list = [t * 1000 for t in itls_raw if t is not None] if isinstance(itls_raw, list) else []
+    else:
+        ttft_list = []
+        itl_list = []
 
-    itls_raw = data.get("itls")
-    if itls_raw and isinstance(itls_raw, list) and len(itls_raw) > 0 and itl_s["mean"] == 0:
-        itl_list = [t * 1000 for t in itls_raw if t is not None]
-        if itl_list:
-            itl_s = stats(itl_list)
+    def q(d, key, default=0):
+        """Get a value, treating None as missing."""
+        v = d.get(key)
+        return v if v is not None else default
 
-    num_ok = data.get("completed", 0)
-    total_input = data.get("total_input_tokens", 0) or data.get("total_input_text_tokens", 0)
-    total_output = data.get("total_output_tokens", 0)
-    duration_s = data.get("duration", 1) or 1
+    # TTFT: 优先用 summary 分位数，min/max 从列表算
+    ttft_s = {
+        "mean": q(data, "mean_ttft_ms"),
+        "p50":  q(data, "median_ttft_ms"),
+        "p90":  q(data, "p90_ttft_ms") or q(data, "p95_ttft_ms"),
+        "p99":  q(data, "p99_ttft_ms"),
+        "min":  min(ttft_list) if ttft_list else 0,
+        "max":  max(ttft_list) if ttft_list else 0,
+    }
+
+    # TPOT: 无 per-request 列表，只从 summary 取
+    def tpot_p90():
+        v = q(data, "p90_tpot_ms")
+        if v:
+            return v
+        v = q(data, "p95_tpot_ms")
+        return v if v else 0
+    tpot_s = {
+        "mean": q(data, "mean_tpot_ms"),
+        "p50":  q(data, "median_tpot_ms"),
+        "p90":  tpot_p90(),
+        "p99":  q(data, "p99_tpot_ms"),
+        "min":  q(data, "min_tpot_ms"),
+        "max":  q(data, "max_tpot_ms"),
+    }
+
+    # ITL: 有 per-request 列表
+    itl_s = {
+        "mean": q(data, "mean_itl_ms"),
+        "p50":  q(data, "median_itl_ms"),
+        "p90":  q(data, "p90_itl_ms") or q(data, "p95_itl_ms"),
+        "p99":  q(data, "p99_itl_ms"),
+        "min":  min(itl_list) if itl_list else 0,
+        "max":  max(itl_list) if itl_list else 0,
+    }
+
+    # E2E: 无 per-request 列表
+    def e2e_p90():
+        v = q(data, "p90_e2e_latency_ms")
+        if v:
+            return v
+        v = q(data, "p95_e2e_latency_ms")
+        return v if v else 0
+    e2e_s = {
+        "mean": q(data, "mean_e2e_latency_ms"),
+        "p50":  q(data, "median_e2e_latency_ms"),
+        "p90":  e2e_p90(),
+        "p99":  q(data, "p99_e2e_latency_ms"),
+        "min":  q(data, "min_e2e_latency_ms"),
+        "max":  q(data, "max_e2e_latency_ms"),
+    }
+
+    # 兜底：如果 summary 全为 0（理论不会），从原始列表重算
+    if ttft_s["mean"] == 0 and ttft_list:
+        ttft_s = stats(ttft_list)
+    if itl_s["mean"] == 0 and itl_list:
+        itl_s = stats(itl_list)
+
+    num_ok = q(data, "completed", 0)
+    total_input = q(data, "total_input_tokens", 0) or q(data, "total_input_text_tokens", 0)
+    total_output = q(data, "total_output_tokens", 0)
+    duration_s = q(data, "duration", 1) or 1
 
     result = {
         "num_requests": num_ok or len(ttfts_raw) if isinstance(ttfts_raw, list) else 0,
         "total_input_tokens": total_input,
         "total_output_tokens": total_output,
         "total_tokens": total_input + total_output,
-        "throughput_tok_s": safe(data, "total_throughput", round((total_input + total_output) / duration_s, 2)),
-        "output_throughput_tok_s": safe(data, "output_throughput", round(total_output / duration_s, 2)),
+        "throughput_tok_s": q(data, "total_throughput", round((total_input + total_output) / duration_s, 2)),
+        "output_throughput_tok_s": q(data, "output_throughput", round(total_output / duration_s, 2)),
         "TTFT": ttft_s,
         "TPOT": tpot_s,
         "ITL":  itl_s,
