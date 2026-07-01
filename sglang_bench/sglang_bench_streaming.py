@@ -172,16 +172,32 @@ def collect_jsonl_metrics(jsonl_path):
 
 
 def parse_stdout_summary(stdout):
-    """从 bench_serving 的 stdout 中摘取吞吐 summary"""
+    """从 bench_serving 的 stdout 中摘取所有指标（比 JSONL 更可靠）"""
     result = {}
     patterns = [
+        (r"Successful requests:\s+(\d+)", "successful_requests"),
+        (r"Benchmark duration \(s\):\s+([\d.]+)", "duration_s"),
         (r"Request throughput \(req/s\):\s+([\d.]+)", "req_throughput"),
         (r"Output token throughput \(tok/s\):\s+([\d.]+)", "output_tok_s"),
         (r"Total token throughput \(tok/s\):\s+([\d.]+)", "total_tok_s"),
-        (r"Benchmark duration \(s\):\s+([\d.]+)", "duration_s"),
-        (r"Successful requests:\s+(\d+)", "successful_requests"),
         (r"Concurrency:\s+([\d.]+)", "concurrency_avg"),
         (r"Peak concurrent requests:\s+(\d+)", "concurrency_peak"),
+        # TTFT
+        (r"Mean TTFT \(ms\):\s+([\d.]+)", "ttft_mean"),
+        (r"Median TTFT \(ms\):\s+([\d.]+)", "ttft_p50"),
+        (r"P99 TTFT \(ms\):\s+([\d.]+)", "ttft_p99"),
+        # TPOT
+        (r"Mean TPOT \(ms\):\s+([\d.]+)", "tpot_mean"),
+        (r"Median TPOT \(ms\):\s+([\d.]+)", "tpot_p50"),
+        (r"P99 TPOT \(ms\):\s+([\d.]+)", "tpot_p99"),
+        # ITL
+        (r"Mean ITL \(ms\):\s+([\d.]+)", "itl_mean"),
+        (r"Median ITL \(ms\):\s+([\d.]+)", "itl_p50"),
+        (r"P99 ITL \(ms\):\s+([\d.]+)", "itl_p99"),
+        # E2E
+        (r"Mean E2E Latency \(ms\):\s+([\d.]+)", "e2e_mean"),
+        (r"Median E2E Latency \(ms\):\s+([\d.]+)", "e2e_p50"),
+        (r"P99 E2E Latency \(ms\):\s+([\d.]+)", "e2e_p99"),
     ]
     for pat, key in patterns:
         m = re.search(pat, stdout)
@@ -385,12 +401,22 @@ def generate_report(all_results, results_dir, args, model_name):
                         continue
 
                     reqs = m["num_requests"]
-                    t = m["TTFT"]
-                    tp = m["TPOT"]
-                    it = m["ITL"]
-                    e2 = m["E2E"]
-                    out_tok_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
-                    tot_tok_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
+                    # 优先用 stdout 指标（更准确），回退到 JSONL
+                    s_metrics = run.get("summary", {}) or {}
+                    t = {"mean": s_metrics.get("ttft_mean", m["TTFT"]["mean"]),
+                         "p50":  s_metrics.get("ttft_p50",  m["TTFT"]["p50"]),
+                         "p99":  s_metrics.get("ttft_p99",  m["TTFT"]["p99"])}
+                    tp = {"mean": s_metrics.get("tpot_mean", m["TPOT"]["mean"]),
+                          "p50":  s_metrics.get("tpot_p50",  m["TPOT"]["p50"]),
+                          "p99":  s_metrics.get("tpot_p99",  m["TPOT"]["p99"])}
+                    it = {"mean": s_metrics.get("itl_mean", m["ITL"]["mean"]),
+                          "p50":  s_metrics.get("itl_p50",  m["ITL"]["p50"]),
+                          "p99":  s_metrics.get("itl_p99",  m["ITL"]["p99"])}
+                    e2 = {"mean": s_metrics.get("e2e_mean", m["E2E"]["mean"]),
+                          "p50":  s_metrics.get("e2e_p50",  m["E2E"]["p50"]),
+                          "p99":  s_metrics.get("e2e_p99",  m["E2E"]["p99"])}
+                    out_tok_s = s_metrics.get("output_tok_s", m["output_throughput_tok_s"])
+                    tot_tok_s = s_metrics.get("total_tok_s", m["throughput_tok_s"])
                     tok_per_req = round(1000 / tp["p50"], 1) if tp["p50"] > 0 else 0
 
                     metric_cols = (
@@ -437,16 +463,19 @@ def generate_report(all_results, results_dir, args, model_name):
                 run = runs[0] if runs else None
                 if run and run["metrics"]:
                     m = run["metrics"]
-                    s = run["summary"]
+                    s = run.get("summary", {}) or {}
+                    def stdout_fallback(key, obj, field):
+                        v = s.get(key)
+                        return v if v is not None else obj[field]
                     f.write("### 结果\n\n")
                     f.write("| 指标 | Mean | p50 | p99 | Min | Max |\n")
                     f.write("|------|------|-----|-----|-----|------|\n")
-                    f.write(f"| TTFT (ms) | {m['TTFT']['mean']:.1f} | {m['TTFT']['p50']:.1f} | {m['TTFT']['p99']:.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
-                    f.write(f"| TPOT (ms) | {m['TPOT']['mean']:.1f} | {m['TPOT']['p50']:.1f} | {m['TPOT']['p99']:.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
-                    f.write(f"| ITL (ms)  | {m['ITL']['mean']:.1f} | {m['ITL']['p50']:.1f} | {m['ITL']['p99']:.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
-                    f.write(f"| E2E (ms)  | {m['E2E']['mean']:.1f} | {m['E2E']['p50']:.1f} | {m['E2E']['p99']:.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
-                    out_s = s.get("output_tok_s", m["output_throughput_tok_s"]) if s else m["output_throughput_tok_s"]
-                    tot_s = s.get("total_tok_s", m["throughput_tok_s"]) if s else m["throughput_tok_s"]
+                    f.write(f"| TTFT (ms) | {stdout_fallback('ttft_mean', m['TTFT'], 'mean'):.1f} | {stdout_fallback('ttft_p50', m['TTFT'], 'p50'):.1f} | {stdout_fallback('ttft_p99', m['TTFT'], 'p99'):.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
+                    f.write(f"| TPOT (ms) | {stdout_fallback('tpot_mean', m['TPOT'], 'mean'):.1f} | {stdout_fallback('tpot_p50', m['TPOT'], 'p50'):.1f} | {stdout_fallback('tpot_p99', m['TPOT'], 'p99'):.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
+                    f.write(f"| ITL (ms)  | {stdout_fallback('itl_mean', m['ITL'], 'mean'):.1f} | {stdout_fallback('itl_p50', m['ITL'], 'p50'):.1f} | {stdout_fallback('itl_p99', m['ITL'], 'p99'):.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
+                    f.write(f"| E2E (ms)  | {stdout_fallback('e2e_mean', m['E2E'], 'mean'):.1f} | {stdout_fallback('e2e_p50', m['E2E'], 'p50'):.1f} | {stdout_fallback('e2e_p99', m['E2E'], 'p99'):.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
+                    out_s = s.get("output_tok_s", m["output_throughput_tok_s"])
+                    tot_s = s.get("total_tok_s", m["throughput_tok_s"])
                     f.write(f"- Requests: {m['num_requests']}\n")
                     f.write(f"- Output throughput: **{out_s:.1f} tok/s**\n")
                     f.write(f"- Total throughput: **{tot_s:.1f} tok/s**\n\n")
@@ -479,7 +508,8 @@ def generate_report(all_results, results_dir, args, model_name):
                 for run in runs:
                     if run and run["metrics"] and run["params"].get("concurrency") == 1:
                         il = run["params"]["input_len"]
-                        ttft = run["metrics"]["TTFT"]["mean"]
+                        s_m = run.get("summary", {}) or {}
+                        ttft = s_m.get("ttft_mean", run["metrics"]["TTFT"]["mean"])
                         per_tok = ttft / il if il > 0 else 0
                         f.write(f"| {il} | 1 | {ttft:.0f} | {per_tok:.4f} |\n")
                 f.write("\n")
@@ -497,9 +527,10 @@ def generate_report(all_results, results_dir, args, model_name):
                 for run in runs:
                     if run and run["metrics"] and run["params"].get("input_len") == 1024:
                         conc = run["params"]["concurrency"]
-                        tpot = run["metrics"]["TPOT"]["p50"]
+                        s_m = run.get("summary", {}) or {}
+                        tpot = s_m.get("tpot_p50", run["metrics"]["TPOT"]["p50"])
                         single = round(1000 / tpot, 1) if tpot > 0 else 0
-                        sys_tok = run["metrics"]["output_throughput_tok_s"]
+                        sys_tok = s_m.get("output_tok_s", run["metrics"]["output_throughput_tok_s"])
                         conc_label = "∞" if conc == 0 else str(conc)
                         f.write(f"| {conc_label} | {tpot:.1f} | {single} | {sys_tok:.1f} |\n")
                 f.write("\n")
