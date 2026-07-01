@@ -1,768 +1,358 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-SGLang 模型性能压测脚本 — 通过 /v1/chat/completions 端点进行流式推理
-支持多场景矩阵测试，输出完整压测报告
+SGLang 自动化压测脚本（场景一：基准输入长度扫描）
 
-用法:
-  # 有 ShareGPT 缓存（推荐，生成有意义文本）
-  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results
+按场景矩阵依次调用 sglang.bench_serving，固定输出长度、逐步拉长输入，
+并在每个输入长度下扫描不同并发，解析每次输出的指标块，
+最终汇总成 Markdown 表格（按输入长度分组）。
 
-  # 离线环境（随机 token ID，无需任何网络）
-  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --random-ids
-
-依赖:
-  pip install numpy
+用法示例：
+    python3 bench_sglang_auto.py --host http://localhost
+    python3 bench_sglang_auto.py --host http://localhost --output-len 1024 \
+        --report report.md --per-run-timeout 3600
+    # 单独压低大输入场景的请求数（默认按并发缩放，可能很久）：
+    python3 bench_sglang_auto.py --num-prompts 32
 """
 
 import argparse
 import csv
-import json
-import os
+import math
 import re
 import subprocess
 import sys
 import time
-from collections import OrderedDict
 from datetime import datetime
 
-# ─────────────────────────────────────────────
-# 配置区
-# ─────────────────────────────────────────────
-SCENARIOS = OrderedDict()
+# ---------------------------------------------------------------------------
+# 场景矩阵：输入长度(token) -> 可选并发列表
+# 1K = 1024 tokens
+# ---------------------------------------------------------------------------
+DEFAULT_SCENARIOS = [
+    (1024,   [1, 4, 8, 16, 32, 64, 128]),
+    (4096,   [1, 4, 8, 16, 32, 64, 128]),
+    (8192,   [1, 4, 8, 16, 32, 64, 128]),
+    (16384,  [1, 4, 8, 16, 32, 64]),
+    (32768,  [1, 4, 8, 16, 32]),
+    (65536,  [1, 4, 8, 16]),
+    (131072, [1, 4, 8]),
+    (262144, [1, 4]),
+]
 
-# ----- 场景 1: 基准输入长度扫描 -----
-# 固定输出长度 512，逐步拉长输入，每级观察 TTFT 增长和并发扩展性
-# concurrency=0 表示不限并发（burst 全部发出）
-SCENARIOS["01_input_len_scan"] = {
-    "desc": "基准: 输入长度扫描 — 固定 output_len=512, 逐级改变并发",
-    "type": "multi_vary",
-    "output_len": 512,
-    "request_rate": "inf",
-    # 场景级 timeout (每个单测另有各自 timeout)
-    "timeout": 7200,
-    "groups": [
-        {"name": "L1-1 短基线", "input_len": 1024,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 20},
-        {"name": "L1-2 短基线", "input_len": 4096,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 20},
-        {"name": "L2-1 中等",   "input_len": 8192,    "concurrency": [1, 4, 8, 16, 32, 64, 128], "prompts": 20},
-        {"name": "L2-2 中长",   "input_len": 16384,   "concurrency": [1, 4, 8, 16, 32, 64],      "prompts": 15},
-        {"name": "L3-1 长",     "input_len": 32768,   "concurrency": [1, 4, 8, 16, 32],          "prompts": 15},
-        {"name": "L3-2 长",     "input_len": 65536,   "concurrency": [1, 4, 8, 16],              "prompts": 15},
-        {"name": "L4-1 超长",   "input_len": 131072,  "concurrency": [1, 4, 8],                  "prompts": 10},
-        {"name": "L4-2 超长",   "input_len": 262144,  "concurrency": [1, 4, 8],                  "prompts": 10},
-        {"name": "L5-1 极限",   "input_len": 524288,  "concurrency": [1, 4],                     "prompts": 10},
-        {"name": "L5-2 极限",   "input_len": 1048576, "concurrency": [1, 2],                     "prompts": 10},
-    ],
+# 输出表格的列（顺序即展示顺序）
+METRIC_COLUMNS = [
+    ("max_concurrency",          "Max request concurrency"),
+    ("successful_requests",      "Successful requests"),
+    ("request_throughput",       "Request throughput (req/s)"),
+    ("output_token_throughput",  "Output token throughput (tok/s)"),
+    ("total_token_throughput",   "Total token throughput (tok/s)"),
+    ("e2e_mean",                 "Mean E2E Latency (ms)"),
+    ("e2e_median",               "Median E2E Latency (ms)"),
+    ("e2e_p99",                  "P99 E2E Latency (ms)"),
+    ("ttft_mean",                "Mean TTFT (ms)"),
+    ("ttft_median",              "Median TTFT (ms)"),
+    ("ttft_p99",                 "P99 TTFT (ms)"),
+    ("tpot_mean",                "Mean TPOT (ms)"),
+    ("tpot_median",              "Median TPOT (ms)"),
+    ("tpot_p99",                 "P99 TPOT (ms)"),
+    ("itl_mean",                 "Mean ITL (ms)"),
+    ("itl_median",               "Median ITL (ms)"),
+    ("itl_p99",                  "P99 ITL (ms)"),
+    ("itl_max",                  "Max ITL (ms)"),
+]
+
+# bench_serving 输出中“标签 -> 我们要存的字段名”映射
+# 用正则按标签抓取数值（去掉千分位逗号）
+LABEL_PATTERNS = {
+    "max_concurrency":          r"Max request concurrency:\s*([\d,]+)",
+    "successful_requests":      r"Successful requests:\s*([\d,]+)",
+    "request_throughput":       r"Request throughput \(req/s\):\s*([\d.]+)",
+    "output_token_throughput":  r"Output token throughput \(tok/s\):\s*([\d.]+)",
+    "total_token_throughput":   r"Total token throughput \(tok/s\):\s*([\d.]+)",
+    "e2e_mean":                 r"Mean E2E Latency \(ms\):\s*([\d.]+)",
+    "e2e_median":               r"Median E2E Latency \(ms\):\s*([\d.]+)",
+    "e2e_p99":                  r"P99 E2E Latency \(ms\):\s*([\d.]+)",
+    "ttft_mean":                r"Mean TTFT \(ms\):\s*([\d.]+)",
+    "ttft_median":              r"Median TTFT \(ms\):\s*([\d.]+)",
+    "ttft_p99":                 r"P99 TTFT \(ms\):\s*([\d.]+)",
+    "tpot_mean":                r"Mean TPOT \(ms\):\s*([\d.]+)",
+    "tpot_median":              r"Median TPOT \(ms\):\s*([\d.]+)",
+    "tpot_p99":                 r"P99 TPOT \(ms\):\s*([\d.]+)",
+    "itl_mean":                 r"Mean ITL \(ms\):\s*([\d.]+)",
+    "itl_median":               r"Median ITL \(ms\):\s*([\d.]+)",
+    "itl_p99":                  r"P99 ITL \(ms\):\s*([\d.]+)",
+    "itl_max":                  r"Max ITL \(ms\):\s*([\d.]+)",
 }
 
 
-# ─────────────────────────────────────────────
-# 工具函数
-# ─────────────────────────────────────────────
-
-def stats(arr):
-    """计算 Mean / p50 / p90 / p99 / Min / Max"""
-    if not arr:
-        return {"mean": 0, "p50": 0, "p90": 0, "p99": 0, "min": 0, "max": 0}
-    s = sorted(arr)
-    n = len(s)
-    return {
-        "mean": round(sum(s) / n, 2),
-        "p50":  round(s[n // 2], 2),
-        "p90":  round(s[int(n * 0.90)], 2),
-        "p99":  round(s[int(n * 0.99)], 2),
-        "min":  round(s[0], 2),
-        "max":  round(s[-1], 2),
-    }
+import urllib.parse
 
 
-def collect_jsonl_metrics(jsonl_path):
-    """从 bench_serving 输出的 JSONL 文件提取延迟指标
-
-    JSONL 格式是单个 JSON 对象包含 summary 字段（mean/p50/p90/p99）
-    和 per-request 列表字段（ttfts: [...], itls: [...]）。
+def normalize_host_port(host_arg, port_arg):
     """
-    try:
-        with open(jsonl_path) as f:
-            content = f.read().strip()
-            if not content:
-                return None
-            data = json.loads(content)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    bench_serving 内部会拼成 http://{host}:{port}/... ，所以 --host 不能带 scheme，
+    端口要单独传。这里把各种写法归一化成 (host, port)：
+      http://localhost        -> ('localhost', 30000)
+      http://localhost:30000  -> ('localhost', 30000)
+      localhost               -> ('localhost', 30000)
+      localhost:8000          -> ('localhost', 8000)
+    port_arg>0 时以 port_arg 为准。
+    """
+    host = host_arg.strip()
+    port = port_arg if port_arg and port_arg > 0 else None
 
-    if not data:
-        return None
+    # 去掉 scheme
+    if "://" in host:
+        parsed = urllib.parse.urlparse(host)
+        host = parsed.hostname or host
+        if port is None and parsed.port:
+            port = parsed.port
+    elif ":" in host:
+        # localhost:8000 形式
+        h, _, p = host.partition(":")
+        host = h
+        if port is None and p.strip().isdigit():
+            port = int(p.strip())
 
-    # 从 per-request 列表提取 min/max（TTFT 和 ITL 有列表，TPOT/E2E 没有）
-    ttfts_raw = data.get("ttfts")
-    if isinstance(ttfts_raw, list) and len(ttfts_raw) > 0:
-        ttft_list = [t * 1000 for t in ttfts_raw if t is not None]
-        itls_raw = data.get("itls")
-        itl_list = [t * 1000 for t in itls_raw if t is not None] if isinstance(itls_raw, list) else []
-    else:
-        ttft_list = []
-        itl_list = []
-
-    def q(d, key, default=0):
-        """Get a value, treating None as missing."""
-        v = d.get(key)
-        return v if v is not None else default
-
-    # TTFT: 优先用 summary 分位数，min/max 从列表算
-    ttft_s = {
-        "mean": q(data, "mean_ttft_ms"),
-        "p50":  q(data, "median_ttft_ms"),
-        "p99":  q(data, "p99_ttft_ms"),
-        "min":  min(ttft_list) if ttft_list else 0,
-        "max":  max(ttft_list) if ttft_list else 0,
-    }
-
-    # TPOT: 无 per-request 列表，只从 summary 取
-    tpot_s = {
-        "mean": q(data, "mean_tpot_ms"),
-        "p50":  q(data, "median_tpot_ms"),
-        "p99":  q(data, "p99_tpot_ms"),
-        "min":  q(data, "min_tpot_ms"),
-        "max":  q(data, "max_tpot_ms"),
-    }
-
-    # ITL: 有 per-request 列表
-    itl_s = {
-        "mean": q(data, "mean_itl_ms"),
-        "p50":  q(data, "median_itl_ms"),
-        "p99":  q(data, "p99_itl_ms"),
-        "min":  min(itl_list) if itl_list else 0,
-        "max":  max(itl_list) if itl_list else 0,
-    }
-
-    # E2E: 无 per-request 列表
-    e2e_s = {
-        "mean": q(data, "mean_e2e_latency_ms"),
-        "p50":  q(data, "median_e2e_latency_ms"),
-        "p99":  q(data, "p99_e2e_latency_ms"),
-        "min":  q(data, "min_e2e_latency_ms"),
-        "max":  q(data, "max_e2e_latency_ms"),
-    }
-
-    # 兜底：如果 summary 全缺失，从原始列表重算
-    if ttft_s["mean"] == 0 and ttft_list:
-        ttft_s = stats(ttft_list)
-    if itl_s["mean"] == 0 and itl_list:
-        itl_s = stats(itl_list)
-
-    num_ok = q(data, "completed", 0)
-    total_input = q(data, "total_input_tokens", 0) or q(data, "total_input_text_tokens", 0)
-    total_output = q(data, "total_output_tokens", 0)
-    duration_s = q(data, "duration", 1) or 1
-
-    result = {
-        "num_requests": num_ok or len(ttfts_raw) if isinstance(ttfts_raw, list) else 0,
-        "total_input_tokens": total_input,
-        "total_output_tokens": total_output,
-        "total_tokens": total_input + total_output,
-        "throughput_tok_s": q(data, "total_throughput", round((total_input + total_output) / duration_s, 2)),
-        "output_throughput_tok_s": q(data, "output_throughput", round(total_output / duration_s, 2)),
-        "TTFT": ttft_s,
-        "TPOT": tpot_s,
-        "ITL":  itl_s,
-        "E2E":  e2e_s,
-    }
-
-    return result
+    if port is None:
+        port = 30000  # sglang 默认端口
+    return host, port
 
 
-def parse_stdout_summary(stdout):
-    """从 bench_serving 的 stdout 中摘取所有指标（比 JSONL 更可靠）"""
-    result = {}
-    patterns = [
-        (r"Successful requests:\s+(\d+)", "successful_requests"),
-        (r"Benchmark duration \(s\):\s+([\d.]+)", "duration_s"),
-        (r"Request throughput \(req/s\):\s+([\d.]+)", "req_throughput"),
-        (r"Output token throughput \(tok/s\):\s+([\d.]+)", "output_tok_s"),
-        (r"Total token throughput \(tok/s\):\s+([\d.]+)", "total_tok_s"),
-        (r"Concurrency:\s+([\d.]+)", "concurrency_avg"),
-        (r"Peak concurrent requests:\s+(\d+)", "concurrency_peak"),
-        # TTFT
-        (r"Mean TTFT \(ms\):\s+([\d.]+)", "ttft_mean"),
-        (r"Median TTFT \(ms\):\s+([\d.]+)", "ttft_p50"),
-        (r"P99 TTFT \(ms\):\s+([\d.]+)", "ttft_p99"),
-        # TPOT
-        (r"Mean TPOT \(ms\):\s+([\d.]+)", "tpot_mean"),
-        (r"Median TPOT \(ms\):\s+([\d.]+)", "tpot_p50"),
-        (r"P99 TPOT \(ms\):\s+([\d.]+)", "tpot_p99"),
-        # ITL
-        (r"Mean ITL \(ms\):\s+([\d.]+)", "itl_mean"),
-        (r"Median ITL \(ms\):\s+([\d.]+)", "itl_p50"),
-        (r"P99 ITL \(ms\):\s+([\d.]+)", "itl_p99"),
-        # E2E
-        (r"Mean E2E Latency \(ms\):\s+([\d.]+)", "e2e_mean"),
-        (r"Median E2E Latency \(ms\):\s+([\d.]+)", "e2e_p50"),
-        (r"P99 E2E Latency \(ms\):\s+([\d.]+)", "e2e_p99"),
-    ]
-    for pat, key in patterns:
+def fmt_input_len(n):
+    """1024 -> '1K', 4096 -> '4K'"""
+    if n % 1024 == 0:
+        k = n // 1024
+        if k >= 1024 and k % 1024 == 0:
+            return f"{k // 1024}M"
+        return f"{k}K"
+    return str(n)
+
+
+def scale_num_prompts(concurrency, low=50, high=200, factor=8):
+    """按并发缩放请求数：clamp(并发*8, 50, 200)"""
+    return max(low, min(high, concurrency * factor))
+
+
+def parse_bench_output(stdout):
+    """从 bench_serving 的 stdout 解析指标，返回 dict。"""
+    metrics = {}
+    for key, pat in LABEL_PATTERNS.items():
         m = re.search(pat, stdout)
-        if m:
-            result[key] = float(m.group(1)) if "." in m.group(1) else int(m.group(1))
-    return result
+        if not m:
+            metrics[key] = None
+            continue
+        raw = m.group(1).replace(",", "")
+        # 数值统一存 float
+        try:
+            val = float(raw)
+            if val.is_integer():
+                val = int(val)
+            metrics[key] = val
+        except ValueError:
+            metrics[key] = raw
+    return metrics
 
 
-# ─────────────────────────────────────────────
-# 核心压测函数
-# ─────────────────────────────────────────────
-
-def run_benchmark(args, scenario_name, params, results_dir, use_random_ids, api_host_key):
-    """
-    执行一次 bench_serving 并返回解析后的指标
-    """
-    host, port = api_host_key
-    result_file = os.path.join(results_dir, f"{scenario_name}.jsonl")
-
+def run_one(args, input_len, output_len, concurrency, num_prompts):
+    """执行单次压测，返回 (metrics_dict, raw_stdout, returncode)。"""
+    host, port = normalize_host_port(args.host, args.port)
     cmd = [
         sys.executable, "-m", "sglang.bench_serving",
-        "--backend", "sglang-oai-chat",
+        "--backend", args.backend,
         "--host", host,
         "--port", str(port),
-        "--tokenizer", params["tokenizer"],
-        "--num-prompts", str(params["prompts"]),
-        "--request-rate", str(params["request_rate"]),
-        "--output-file", result_file,
-        "--output-details",
-        "--warmup-requests", "10",
-        "--disable-tqdm",
-        "--apply-chat-template",
-        # 注意: 不加 --disable-stream，保持流式
+        "--dataset-name", args.dataset_name,
+        "--num-prompts", str(num_prompts),
+        "--max-concurrency", str(concurrency),
+        "--random-input-len", str(input_len),
+        "--random-output-len", str(output_len),
     ]
+    if args.extra_args:
+        cmd += args.extra_args.split()
 
-    # concurrency=0 表示不限并发，不传 --max-concurrency
-    concur = params.get("concurrency")
-    if concur and concur > 0:
-        cmd += ["--max-concurrency", str(concur)]
+    label = f"input={fmt_input_len(input_len)} out={output_len} conc={concurrency} np={num_prompts}"
+    print(f"\n>>> [RUN] {label}", flush=True)
+    print(f"    cmd: {' '.join(cmd)}  (-> http://{host}:{port})", flush=True)
 
-    if params.get("model"):
-        cmd += ["--model", params["model"]]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=args.per_run_timeout,
+            check=False,
+        )
+        out = proc.stdout or ""
+        rc = proc.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        print(f"    [TIMEOUT] 超过 {args.per_run_timeout}s，跳过该场景", flush=True)
+        return None, out, -1
+    except Exception as e:
+        print(f"    [ERROR] {e}", flush=True)
+        return None, str(e), -2
 
-    # ---- 数据集参数 ----
-    if params.get("gsp_groups"):
-        # GSP 场景
-        cmd += [
-            "--dataset-name", "generated-shared-prefix",
-            "--gsp-num-groups", str(params["gsp_groups"]),
-            "--gsp-prompts-per-group", str(params["gsp_per_group"]),
-            "--gsp-system-prompt-len", str(params["gsp_system"]),
-            "--gsp-question-len", str(params["gsp_question"]),
-            "--gsp-output-len", str(params["gsp_output"]),
-        ]
-    else:
-        # 普通场景
-        dataset_name = "random-ids" if use_random_ids else "random"
-        cmd += [
-            "--dataset-name", dataset_name,
-            "--random-input-len", str(params["input_len"]),
-            "--random-output-len", str(params["output_len"]),
-        ]
+    elapsed = time.time() - t0
+    metrics = parse_bench_output(out)
+    print(f"    done in {elapsed:.1f}s (rc={rc})", flush=True)
 
-    # 打印命令（精简版）
-    desc_key = params.get("vary_name", "")
-    print(f"    └─ {desc_key}...", end=" ", flush=True)
+    # 解析失败时打印尾部日志，便于排查
+    if metrics.get("successful_requests") is None:
+        print("    [WARN] 未能解析到 Successful requests，尾部日志：", flush=True)
+        tail = "\n".join(out.splitlines()[-30:])
+        print("    " + tail.replace("\n", "\n    "), flush=True)
 
-    timeout = params.get("timeout", 600)
-    start = time.time()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    elapsed = time.time() - start
-    stdout = proc.stdout
-    stderr = proc.stderr
-
-    if proc.returncode != 0:
-        print(f"[FAIL exit={proc.returncode}, {elapsed:.0f}s]")
-        err_lines = stderr.strip().split("\n")[-5:]
-        for line in err_lines:
-            if line.strip():
-                print(f"      {line.strip()}")
-        return None
-
-    print(f"[OK {elapsed:.0f}s]")
-
-    # 解析结果
-    metrics = collect_jsonl_metrics(result_file)
-    summary = parse_stdout_summary(stdout)
-
-    result = {"params": params, "metrics": metrics, "summary": summary, "file": result_file}
-    return result
+    return metrics, out, rc
 
 
-# ─────────────────────────────────────────────
-# 报告生成
-# ─────────────────────────────────────────────
-
-def format_value(v, unit=""):
-    """格式化数值，避免 .00"""
+def fmt_cell(v):
+    if v is None:
+        return "-"
     if isinstance(v, float):
-        if v == int(v):
-            return f"{int(v)}{unit}"
-        return f"{v:.2f}{unit}"
-    return f"{v}{unit}"
+        # 整数类指标保留整数，吞吐/延迟保留两位
+        return f"{v:.2f}"
+    return str(v)
 
 
-def print_metric_row(name, metrics_dict, unit="ms"):
-    if not metrics_dict:
-        return f"  {name:<10}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}  {'—':>8}\n"
-    d = metrics_dict
-    return (
-        f"  {name:<10}"
-        f"  {d['mean']:>8.1f}"
-        f"  {d['p50']:>8.1f}"
-        f"  {d['p90']:>8.1f}"
-        f"  {d['p99']:>8.1f}"
-        f"  {d['min']:>8.1f}"
-        f"  {d['max']:>8.1f}\n"
-    )
+def build_markdown(report_path, meta, results):
+    """results: list of dict，每项含 input_len, output_len, concurrency, num_prompts, metrics..."""
+    lines = []
+    lines.append(f"# SGLang 自动化压测报告")
+    lines.append("")
+    lines.append(f"- 生成时间：{meta['generated_at']}")
+    lines.append(f"- 后端：`{meta['backend']}`")
+    lines.append(f"- Host：`{meta['host']}`")
+    lines.append(f"- 数据集：`{meta['dataset_name']}`")
+    lines.append(f"- 固定输出长度：{meta['output_len']} tokens")
+    lines.append(f"- 场景总数：{len(results)}（成功 {sum(1 for r in results if r['ok'])} / 失败 {sum(1 for r in results if not r['ok'])}）")
+    lines.append("")
 
+    # 按输入长度分组
+    by_input = {}
+    for r in results:
+        by_input.setdefault(r["input_len"], []).append(r)
 
-def generate_report(all_results, results_dir, args, model_name):
-    """生成完整的压测报告 Markdown 文件"""
-    report_path = os.path.join(results_dir, "bench_report.md")
-    csv_path = os.path.join(results_dir, "all_results.csv")
+    header_cells = ["输入长度", "输出长度", "并发", "num_prompts"] + [c[1] for c in METRIC_COLUMNS]
+    sep = ["---"] * len(header_cells)
+
+    for input_len in sorted(by_input.keys()):
+        group = by_input[input_len]
+        lines.append(f"## 输入长度 {fmt_input_len(input_len)} ({input_len} tokens)")
+        lines.append("")
+        lines.append("| " + " | ".join(header_cells) + " |")
+        lines.append("| " + " | ".join(sep) + " |")
+        for r in group:
+            row = [
+                fmt_input_len(r["input_len"]),
+                str(r["output_len"]),
+                str(r["concurrency"]),
+                str(r["num_prompts"]),
+            ]
+            if r["ok"]:
+                for key, _ in METRIC_COLUMNS:
+                    row.append(fmt_cell(r["metrics"].get(key)))
+            else:
+                row += ["FAILED"] * len(METRIC_COLUMNS)
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
 
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# SGLang 模型性能压测报告\n\n")
-        f.write(f"- **测试时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"- **API 端点**: {args.api_url}/v1/chat/completions (流式)\n")
-        f.write(f"- **模型**: {model_name}\n")
-        f.write(f"- **Tokenizer**: {args.tokenizer}\n")
-        f.write(f"- **Backend**: sglang-oai-chat\n")
-        f.write(f"- **数据集**: {'random-ids (离线随机ID)' if args.random_ids else 'random (ShareGPT采样文本)'}\n")
-        f.write(f"- **流式**: 是\n\n")
+        f.write("\n".join(lines))
 
-        f.write("---\n\n## 指标说明\n\n")
-        f.write("| 指标 | 含义 |\n")
-        f.write("|------|------|\n")
-        f.write("| **TTFT** | Time To First Token — 首 token 延迟 (ms)，反映 prefill 速度 |\n")
-        f.write("| **TPOT** | Time Per Output Token — 每个输出 token 平均耗时 (ms)，反映 decode 速度 |\n")
-        f.write("| **ITL** | Inter-Token Latency — token 间延迟抖动 (ms)，反映流式平滑度 |\n")
-        f.write("| **E2E** | End-to-End Latency — 请求总完成时间 (ms) |\n")
-        f.write("| **Tok/s per req** | 单论次吞吐 = 1000 / TPOT(p50) |\n")
-        f.write("| **Output tok/s** | 系统级输出 token 吞吐量 |\n\n")
-
-        f.write("---\n\n")
-
-        # CSV header
-        csv_rows = []
-        csv_header = [
-            "scenario", "vary_param", "input_len", "output_len", "concurrency",
-            "request_rate", "num_prompts", "successful",
-            "TTFT_mean", "TTFT_p50", "TTFT_p99",
-            "TPOT_mean", "TPOT_p50", "TPOT_p99",
-            "ITL_mean", "ITL_p50", "ITL_p99",
-            "E2E_mean", "E2E_p50", "E2E_p99",
-            "output_tok_s", "total_tok_s", "tok_per_req",
-        ]
-        csv_rows.append(csv_header)
-
-        for scenario_name, runs in all_results.items():
-            if not runs:
-                continue
-            scenario = SCENARIOS[scenario_name]
-            f.write(f"## {scenario_name}: {scenario['desc']}\n\n")
-
-            is_multi = scenario.get("type") == "multi_vary"
-
-            # ---- multi_vary / vary 共用表格逻辑 ----
-            if is_multi or scenario.get("vary"):
-                if is_multi:
-                    hdr_cnt = 18
-                    f.write("| Input Len | Concur | Reqs"
-                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p99(ms)"
-                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p99(ms)"
-                            " | ITL mean(ms) | ITL p50(ms) | ITL p99(ms)"
-                            " | E2E mean(ms) | E2E p50(ms) | E2E p99(ms)"
-                            " | Output tok/s | Total tok/s | Tok/s per req |\n")
-                else:
-                    hdr_cnt = 16
-                    f.write(f"| {scenario['vary']} | Reqs"
-                            " | TTFT mean(ms) | TTFT p50(ms) | TTFT p99(ms)"
-                            " | TPOT mean(ms) | TPOT p50(ms) | TPOT p99(ms)"
-                            " | ITL mean(ms) | ITL p50(ms) | ITL p99(ms)"
-                            " | E2E mean(ms) | E2E p50(ms) | E2E p99(ms)"
-                            " | Output tok/s | Total tok/s | Tok/s per req |\n")
-                f.write("|" + "---|" * hdr_cnt + "\n")
-
-                for run in runs:
-                    if run is None:
-                        continue
-                    p = run["params"]
-                    m = run["metrics"]
-                    s = run["summary"]
-                    if m is None:
-                        continue
-
-                    reqs = m["num_requests"]
-                    # 优先用 stdout 指标（更准确），回退到 JSONL
-                    s_metrics = run.get("summary", {}) or {}
-                    t = {"mean": s_metrics.get("ttft_mean", m["TTFT"]["mean"]),
-                         "p50":  s_metrics.get("ttft_p50",  m["TTFT"]["p50"]),
-                         "p99":  s_metrics.get("ttft_p99",  m["TTFT"]["p99"])}
-                    tp = {"mean": s_metrics.get("tpot_mean", m["TPOT"]["mean"]),
-                          "p50":  s_metrics.get("tpot_p50",  m["TPOT"]["p50"]),
-                          "p99":  s_metrics.get("tpot_p99",  m["TPOT"]["p99"])}
-                    it = {"mean": s_metrics.get("itl_mean", m["ITL"]["mean"]),
-                          "p50":  s_metrics.get("itl_p50",  m["ITL"]["p50"]),
-                          "p99":  s_metrics.get("itl_p99",  m["ITL"]["p99"])}
-                    e2 = {"mean": s_metrics.get("e2e_mean", m["E2E"]["mean"]),
-                          "p50":  s_metrics.get("e2e_p50",  m["E2E"]["p50"]),
-                          "p99":  s_metrics.get("e2e_p99",  m["E2E"]["p99"])}
-                    out_tok_s = s_metrics.get("output_tok_s", m["output_throughput_tok_s"])
-                    tot_tok_s = s_metrics.get("total_tok_s", m["throughput_tok_s"])
-                    tok_per_req = round(1000 / tp["p50"], 1) if tp["p50"] > 0 else 0
-
-                    metric_cols = (
-                        f" | {t['mean']:.0f} | {t['p50']:.0f} | {t['p99']:.0f}"
-                        f" | {tp['mean']:.1f} | {tp['p50']:.1f} | {tp['p99']:.1f}"
-                        f" | {it['mean']:.1f} | {it['p50']:.1f} | {it['p99']:.1f}"
-                        f" | {e2['mean']:.0f} | {e2['p50']:.0f} | {e2['p99']:.0f}"
-                        f" | {out_tok_s:.1f} | {tot_tok_s:.1f} | {tok_per_req}"
-                    )
-
-                    if is_multi:
-                        ilen = p.get("input_len", "")
-                        conc = p.get("concurrency", "")
-                        conc_label = "∞" if conc == 0 else str(conc)
-                        f.write(f"| {ilen} / {conc_label} | {reqs}{metric_cols} |\n")
-                        csv_rows.append([
-                            scenario_name, f"{ilen}/{conc}",
-                            str(ilen), str(p.get("output_len", "")),
-                            str(conc), str(p.get("request_rate", "")),
-                            str(p.get("prompts", "")), str(reqs),
-                            str(t['mean']), str(t['p50']), str(t['p99']),
-                            str(tp['mean']), str(tp['p50']), str(tp['p99']),
-                            str(it['mean']), str(it['p50']), str(it['p99']),
-                            str(e2['mean']), str(e2['p50']), str(e2['p99']),
-                            str(out_tok_s), str(tot_tok_s), str(tok_per_req),
-                        ])
-                    else:
-                        vary_val = p.get("vary_name", "")
-                        f.write(f"| {vary_val} | {reqs}{metric_cols} |\n")
-                        csv_rows.append([
-                            scenario_name, str(vary_val),
-                            str(p.get("input_len", "")), str(p.get("output_len", "")),
-                            str(p.get("concurrency", "")), str(p.get("request_rate", "")),
-                            str(p.get("prompts", "")), str(reqs),
-                            str(t['mean']), str(t['p50']), str(t['p99']),
-                            str(tp['mean']), str(tp['p50']), str(tp['p99']),
-                            str(it['mean']), str(it['p50']), str(it['p99']),
-                            str(e2['mean']), str(e2['p50']), str(e2['p99']),
-                            str(out_tok_s), str(tot_tok_s), str(tok_per_req),
-                        ])
-
-            else:
-                # 单次运行场景
-                run = runs[0] if runs else None
-                if run and run["metrics"]:
-                    m = run["metrics"]
-                    s = run.get("summary", {}) or {}
-                    def stdout_fallback(key, obj, field):
-                        v = s.get(key)
-                        return v if v is not None else obj[field]
-                    f.write("### 结果\n\n")
-                    f.write("| 指标 | Mean | p50 | p99 | Min | Max |\n")
-                    f.write("|------|------|-----|-----|-----|------|\n")
-                    f.write(f"| TTFT (ms) | {stdout_fallback('ttft_mean', m['TTFT'], 'mean'):.1f} | {stdout_fallback('ttft_p50', m['TTFT'], 'p50'):.1f} | {stdout_fallback('ttft_p99', m['TTFT'], 'p99'):.1f} | {m['TTFT']['min']:.1f} | {m['TTFT']['max']:.1f} |\n")
-                    f.write(f"| TPOT (ms) | {stdout_fallback('tpot_mean', m['TPOT'], 'mean'):.1f} | {stdout_fallback('tpot_p50', m['TPOT'], 'p50'):.1f} | {stdout_fallback('tpot_p99', m['TPOT'], 'p99'):.1f} | {m['TPOT']['min']:.1f} | {m['TPOT']['max']:.1f} |\n")
-                    f.write(f"| ITL (ms)  | {stdout_fallback('itl_mean', m['ITL'], 'mean'):.1f} | {stdout_fallback('itl_p50', m['ITL'], 'p50'):.1f} | {stdout_fallback('itl_p99', m['ITL'], 'p99'):.1f} | {m['ITL']['min']:.1f} | {m['ITL']['max']:.1f} |\n")
-                    f.write(f"| E2E (ms)  | {stdout_fallback('e2e_mean', m['E2E'], 'mean'):.1f} | {stdout_fallback('e2e_p50', m['E2E'], 'p50'):.1f} | {stdout_fallback('e2e_p99', m['E2E'], 'p99'):.1f} | {m['E2E']['min']:.1f} | {m['E2E']['max']:.1f} |\n\n")
-                    out_s = s.get("output_tok_s", m["output_throughput_tok_s"])
-                    tot_s = s.get("total_tok_s", m["throughput_tok_s"])
-                    f.write(f"- Requests: {m['num_requests']}\n")
-                    f.write(f"- Output throughput: **{out_s:.1f} tok/s**\n")
-                    f.write(f"- Total throughput: **{tot_s:.1f} tok/s**\n\n")
-
-                    tok_pr = round(1000 / m["TPOT"]["p50"], 1) if m["TPOT"]["p50"] > 0 else 0
-                    csv_rows.append([
-                        scenario_name, "single",
-                        str(run["params"].get("input_len", "")), str(run["params"].get("output_len", "")),
-                        str(run["params"].get("concurrency", "")), "inf",
-                        str(run["params"].get("prompts", "")), str(m["num_requests"]),
-                        str(m['TTFT']['mean']), str(m['TTFT']['p50']), str(m['TTFT']['p99']),
-                        str(m['TPOT']['mean']), str(m['TPOT']['p50']), str(m['TPOT']['p99']),
-                        str(m['ITL']['mean']), str(m['ITL']['p50']), str(m['ITL']['p99']),
-                        str(m['E2E']['mean']), str(m['E2E']['p50']), str(m['E2E']['p99']),
-                        str(out_s), str(tot_s), str(tok_pr),
-                    ])
-
-            f.write("\n---\n\n")
-
-        # ---- 瓶颈分析 ----
-        f.write("## 瓶颈分析\n\n")
-        f.write("### Prefill 瓶颈 (TTFT / input_len)\n\n")
-        f.write("TTFT 除以输入长度得到每个输入 token 的 prefill 时间 (ms/tok)，值越低 prefill 效率越高。\n\n")
-
-        # 从场景1抓 low-concurrency 数据（取 concur=1 的数据行）
-        for sn, runs in all_results.items():
-            if sn.startswith("01") and runs:
-                f.write("| Input Len | Concur | TTFT mean(ms) | ms per input token |\n")
-                f.write("|-----------|--------|---------------|--------------------|\n")
-                for run in runs:
-                    if run and run["metrics"] and run["params"].get("concurrency") == 1:
-                        il = run["params"]["input_len"]
-                        s_m = run.get("summary", {}) or {}
-                        ttft = s_m.get("ttft_mean", run["metrics"]["TTFT"]["mean"])
-                        per_tok = ttft / il if il > 0 else 0
-                        f.write(f"| {il} | 1 | {ttft:.0f} | {per_tok:.4f} |\n")
-                f.write("\n")
-                break
-
-        f.write("### Decode 瓶颈 (TPOT)\n\n")
-        f.write("TPOT 越低 decode 越快，单流吞吐 = 1000/TPOT(ms) tok/s。\n\n")
-
-        # 从场景1抓 concur 变化对 TPOT 的影响（固定一个输入长度，如 1024）
-        for sn, runs in all_results.items():
-            if sn.startswith("01") and runs:
-                # 选输入长度 = 1024 的数据
-                f.write("| Concur | TPOT p50(ms) | Tok/s per request | Output tok/s (系统) |\n")
-                f.write("|--------|--------------|--------------------|----------------------|\n")
-                for run in runs:
-                    if run and run["metrics"] and run["params"].get("input_len") == 1024:
-                        conc = run["params"]["concurrency"]
-                        s_m = run.get("summary", {}) or {}
-                        tpot = s_m.get("tpot_p50", run["metrics"]["TPOT"]["p50"])
-                        single = round(1000 / tpot, 1) if tpot > 0 else 0
-                        sys_tok = s_m.get("output_tok_s", run["metrics"]["output_throughput_tok_s"])
-                        conc_label = "∞" if conc == 0 else str(conc)
-                        f.write(f"| {conc_label} | {tpot:.1f} | {single} | {sys_tok:.1f} |\n")
-                f.write("\n")
-                break
-
-        # ---- 结论 ----
-        f.write("## 结论与建议\n\n")
-        f.write("1. **最大吞吐**: ")
-        max_tok_s = 0
-        max_scenario = ""
-        for scenario_name, runs in all_results.items():
-            for run in runs:
-                if run and run.get("summary"):
-                    ts = run["summary"].get("total_tok_s", 0)
-                    if ts > max_tok_s:
-                        max_tok_s = ts
-                        max_scenario = scenario_name
-        f.write(f"系统总吞吐峰值 **{max_tok_s:.1f} tok/s**（场景: {max_scenario}）\n")
-        f.write("2. 建议生产环境并发控制在 TTFT 开始显著恶化的拐点以下\n")
-        f.write("3. 具体调优方向请结合上述分场景数据\n\n")
-
-        f.write("---\n")
-        f.write(f"报告自动生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  原始数据: `result_*.jsonl`\n")
-
-    # 写 CSV
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        for row in csv_rows:
-            writer.writerow(row)
-
-    print(f"\n  📄 报告: {report_path}")
-    print(f"  📊 数据: {csv_path}")
-    return report_path
-
-
-# ─────────────────────────────────────────────
-# 主函数
-# ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="SGLang 模型性能压测 — /v1/chat/completions 流式推理",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 有 ShareGPT 缓存
-  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results
+    ap = argparse.ArgumentParser(description="SGLang 自动化压测（场景一：输入长度扫描）")
+    ap.add_argument("--host", default="http://localhost", help="服务地址")
+    ap.add_argument("--port", type=int, default=0, help="端口（0=不传，使用 host 中自带）")
+    ap.add_argument("--backend", default="sglang-oai-chat")
+    ap.add_argument("--dataset-name", default="random")
+    ap.add_argument("--output-len", type=int, default=1024, help="固定输出长度（token）")
+    ap.add_argument("--num-prompts", type=int, default=0,
+                    help="固定请求数；0=按并发缩放 clamp(并发*8,50,200)")
+    ap.add_argument("--per-run-timeout", type=int, default=3600,
+                    help="单次压测超时（秒），大输入/高并发建议调大")
+    ap.add_argument("--report", default="bench_report.md", help="Markdown 报告输出路径")
+    ap.add_argument("--csv", default="", help="可选：同时输出 CSV 路径")
+    ap.add_argument("--extra-args", default="", help="透传给 bench_serving 的额外参数（原样拼接）")
+    ap.add_argument("--only-input", type=str, default="",
+                    help="只跑指定输入长度，逗号分隔，如 1024,4096")
+    ap.add_argument("--only-concurrency", type=str, default="",
+                    help="只跑指定并发，逗号分隔，如 1,16")
+    ap.add_argument("--dry-run", action="store_true", help="只打印将执行的命令，不真正运行")
+    args = ap.parse_args()
 
-  # 离线（纯随机 ID）
-  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --random-ids
+    # 过滤场景
+    only_input = set()
+    if args.only_input:
+        only_input = {int(x) for x in args.only_input.split(",") if x.strip()}
+    only_conc = set()
+    if args.only_concurrency:
+        only_conc = {int(x) for x in args.only_concurrency.split(",") if x.strip()}
 
-  # 只跑指定场景（逗号分隔）
-  python3 sglang_bench_streaming.py http://localhost:30000 /mnt/data/models/gemma-4-12B-it ./results --only 01,03
-        """,
-    )
-    parser.add_argument("api_url", help="SGLang 服务地址，如 http://localhost:30000")
-    parser.add_argument("tokenizer", help="Tokenizer 路径或模型名")
-    parser.add_argument("output_dir", nargs="?", default="./bench_results", help="输出目录 (默认: ./bench_results)")
-    parser.add_argument("--random-ids", action="store_true", help="使用 random-ids 数据集（离线兼容，无需网络）")
-    parser.add_argument("--only", help="只跑指定场景编号，逗号分隔 如 01,03")
-    parser.add_argument("--no-model-name", action="store_true", help="不传 --model 参数（服务端自动识别）")
-    parser.add_argument("--dry-run", action="store_true", help="只打印命令，不实际执行")
-    args = parser.parse_args()
+    scenarios = []
+    for input_len, conc_list in DEFAULT_SCENARIOS:
+        if only_input and input_len not in only_input:
+            continue
+        for c in conc_list:
+            if only_conc and c not in only_conc:
+                continue
+            scenarios.append((input_len, c))
 
-    # 解析 API URL
-    api_url = args.api_url.rstrip("/")
-    api_url_clean = api_url.replace("http://", "").replace("https://", "")
-    api_url_clean = api_url_clean.replace("/v1", "").replace("/chat/completions", "")
-    if ":" in api_url_clean:
-        host, port = api_url_clean.split(":")
-        port = int(port)
-    else:
-        host = api_url_clean
-        port = 80
-
-    api_host_key = (host, port)
-
-    # 检查服务可用
-    model_name = "unknown"
-    if args.dry_run:
-        model_name = "<model-from-server>"
-        print("  [dry-run] 跳过服务检查")
-    else:
-        print("🔍 检查服务可用性...", end=" ", flush=True)
-        ret = os.system(f"curl -sf {api_url}/health > /dev/null 2>&1")
-        if ret != 0:
-            print(f"✗ 端点不可用: {api_url}/health")
-            ret = os.system(f"curl -sf {api_url}/v1/models > /dev/null 2>&1")
-            if ret != 0:
-                print(f"✗ 无法连接: {api_url}")
-                sys.exit(1)
-        print("✓")
-
-        try:
-            r = subprocess.run(
-                ["curl", "-sf", f"{api_url}/v1/models"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode == 0:
-                data = json.loads(r.stdout)
-                model_name = data.get("data", [{}])[0].get("id", "unknown")
-        except Exception:
-            pass
-    print(f"  🧠 模型: {model_name}\n")
-
-    # 创建输出目录
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = os.path.join(args.output_dir, timestamp)
-    os.makedirs(results_dir, exist_ok=True)
-
-    # 筛选场景
-    if args.only:
-        selected = set(args.only.split(","))
-        scenarios_to_run = OrderedDict(
-            (k, v) for k, v in SCENARIOS.items()
-            if any(k.startswith(s) for s in selected)
-        )
-    else:
-        scenarios_to_run = SCENARIOS
-
-    print(f"📋 测试计划 ({len(scenarios_to_run)} 个场景):")
-    for name, sc in scenarios_to_run.items():
-        if sc.get("type") == "multi_vary":
-            total_tests = sum(len(g["concurrency"]) for g in sc["groups"])
-            print(f"  [{name}] {sc['desc']}")
-            print(f"         {total_tests} 个单测,  {len(sc['groups'])} 组输入长度")
-            for g in sc["groups"]:
-                tag = f" [{g['name']}]" if g.get("name") else ""
-                conc_str = ",".join(str(c) if c != 0 else "∞" for c in g["concurrency"])
-                print(f"           {g['input_len']:>7} tok{tag}  concur=[{conc_str}]  prompts={g.get('prompts', sc.get('prompts', 50))}")
-        else:
-            print(f"  [{name}] {sc['desc']} (单次)")
-    print()
+    print(f"共 {len(scenarios)} 个场景待执行。", flush=True)
 
     if args.dry_run:
-        print("🏁 Dry-run 模式，不执行。")
+        for input_len, c in scenarios:
+            np = args.num_prompts if args.num_prompts > 0 else scale_num_prompts(c)
+            print(f"  input={fmt_input_len(input_len)} conc={c} num_prompts={np}")
         return
 
-    # 执行测试
-    all_results = OrderedDict()
-    total_runs = 0
-    for sc in scenarios_to_run.values():
-        if sc.get("type") == "multi_vary":
-            total_runs += sum(len(g["concurrency"]) for g in sc["groups"])
-        else:
-            total_runs += 1
+    results = []
+    norm_host, norm_port = normalize_host_port(args.host, args.port)
+    for idx, (input_len, concurrency) in enumerate(scenarios, 1):
+        np = args.num_prompts if args.num_prompts > 0 else scale_num_prompts(concurrency)
+        print(f"\n===== [{idx}/{len(scenarios)}] =====", flush=True)
+        metrics, raw, rc = run_one(args, input_len, args.output_len, concurrency, np)
+        ok = metrics is not None and metrics.get("successful_requests") is not None
+        results.append({
+            "input_len": input_len,
+            "output_len": args.output_len,
+            "concurrency": concurrency,
+            "num_prompts": np,
+            "ok": ok,
+            "metrics": metrics or {},
+            "returncode": rc,
+        })
+        # 每跑完一个场景就增量写一次报告，避免中途断了全丢
+        meta = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "backend": args.backend,
+            "host": f"{norm_host}:{norm_port}",
+            "dataset_name": args.dataset_name,
+            "output_len": args.output_len,
+        }
+        build_markdown(args.report, meta, results)
 
-    run_count = 0
+    # CSV（可选）
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["input_len", "output_len", "concurrency", "num_prompts",
+                        "ok"] + [c[1] for c in METRIC_COLUMNS])
+            for r in results:
+                row = [r["input_len"], r["output_len"], r["concurrency"],
+                       r["num_prompts"], int(r["ok"])]
+                if r["ok"]:
+                    row += [fmt_cell(r["metrics"].get(k)) for k, _ in METRIC_COLUMNS]
+                else:
+                    row += [""] * len(METRIC_COLUMNS)
+                w.writerow(row)
 
-    for scenario_name, scenario in scenarios_to_run.items():
-        print(f"\n{'='*60}")
-        print(f" 场景: {scenario_name}")
-        print(f" {scenario['desc']}")
-        print(f"{'='*60}")
-
-        runs = []
-        scenario_timeout = scenario.get("timeout")
-
-        if scenario.get("type") == "multi_vary":
-            # ---- multi_vary: 遍历 groups → 每个 group 遍历 concurrency ----
-            for gi, group in enumerate(scenario["groups"]):
-                ilen = group["input_len"]
-                olen = scenario["output_len"]
-                group_prompts = group.get("prompts", scenario.get("prompts", 50))
-                tag = group.get("name", "")
-
-                for ci, conc in enumerate(group["concurrency"]):
-                    run_count += 1
-                    conc_label = "∞" if conc == 0 else str(conc)
-                    desc = f"{tag}/{ilen}tok/concur={conc_label}" if tag else f"{ilen}tok/concur={conc_label}"
-                    print(f"  [{run_count}/{total_runs}] {desc}...", end=" ", flush=True)
-
-                    params = {
-                        "input_len": ilen,
-                        "output_len": olen,
-                        "concurrency": conc,
-                        "request_rate": scenario["request_rate"],
-                        "prompts": group_prompts,
-                        "vary_name": f"{ilen}_{conc}",
-                        "tokenizer": args.tokenizer,
-                    }
-                    if not args.no_model_name:
-                        params["model"] = model_name
-                    if scenario_timeout:
-                        params["timeout"] = scenario_timeout
-
-                    sfx = f"{scenario_name}_in{ilen}_c{conc}"
-                    result = run_benchmark(
-                        args, sfx, params,
-                        results_dir, args.random_ids, api_host_key,
-                    )
-                    runs.append(result)
-                    time.sleep(0.5)
-        else:
-            run_count += 1
-            print(f"  [{run_count}/{total_runs}] ", end="")
-            params = dict(scenario["fixed"])
-            params["tokenizer"] = args.tokenizer
-            if not args.no_model_name:
-                params["model"] = model_name
-            params["vary_name"] = "single"
-            if scenario_timeout:
-                params["timeout"] = scenario_timeout
-
-            result = run_benchmark(
-                args, scenario_name, params,
-                results_dir, args.random_ids, api_host_key,
-            )
-            runs.append(result)
-            time.sleep(0.5)
-
-        all_results[scenario_name] = runs
-
-        # 打印该场景摘要
-        for run in runs:
-            if run and run["metrics"] and run["summary"]:
-                s = run["summary"]
-                tok = s.get("output_tok_s", "—")
-                print(f"      → req={s.get('successful_requests','—')}  out_tok/s={tok}")
-
-    # 生成报告
-    print(f"\n{'='*60}")
-    print(f" 生成报告...")
-    print(f"{'='*60}")
-    report = generate_report(all_results, results_dir, args, model_name)
-
-    # 打印报告路径和摘要
-    csv_path = os.path.join(results_dir, "all_results.csv")
-    print(f"\n✅ 测试完成！结果目录: {results_dir}")
-    print(f"   📄 报告: {report}")
-    print(f"   📊 CSV:  {csv_path}")
-    print(f"   📁 JSONL: {results_dir}/*.jsonl")
+    ok_n = sum(1 for r in results if r["ok"])
+    print(f"\n全部完成：成功 {ok_n}/{len(results)}", flush=True)
+    print(f"报告已写入：{args.report}", flush=True)
 
 
 if __name__ == "__main__":
